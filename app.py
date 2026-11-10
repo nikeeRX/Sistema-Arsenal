@@ -1,53 +1,80 @@
 import os
 import socket
 import sqlite3
+from urllib.parse import urlparse
 from datetime import datetime
 from functools import wraps
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+    import pg8000.dbapi as pg_dbapi
 except ImportError:
-    psycopg2 = None
+    pg_dbapi = None
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ts3_guild_tracker_secret_key_2026")
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# Aceita DATABASE_URL padrão ou variáveis separadas do Postgres no Railway
+def get_database_url():
+    url = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
+    if url:
+        return url.strip()
+    pghost = os.environ.get("PGHOST")
+    pguser = os.environ.get("PGUSER")
+    pgpass = os.environ.get("PGPASSWORD")
+    pgdb = os.environ.get("PGDATABASE")
+    pgport = os.environ.get("PGPORT", "5432")
+    if pghost and pguser and pgpass and pgdb:
+        return f"postgresql://{pguser}:{pgpass}@{pghost}:{pgport}/{pgdb}"
+    return None
 
 # ==========================================
-# CAMADA DE BANCO DE DADOS (POSTGRES / SQLITE)
+# CAMADA DE BANCO DE DADOS (PG8000 / SQLITE)
 # ==========================================
 def is_postgres():
-    return bool(DATABASE_URL and psycopg2)
+    return bool(get_database_url() and pg_dbapi)
 
 def get_db_connection():
-    if is_postgres():
-        db_url = DATABASE_URL
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+    db_url = get_database_url()
+    if db_url and pg_dbapi:
+        parsed = urlparse(db_url)
+        return pg_dbapi.connect(
+            user=parsed.username,
+            password=parsed.password,
+            host=parsed.hostname,
+            port=int(parsed.port or 5432),
+            database=parsed.path.lstrip("/")
+        )
     else:
         conn = sqlite3.connect("guild_tracker.db")
         conn.row_factory = sqlite3.Row
         return conn
 
 def db_execute(query, params=(), fetch=False, fetchone=False):
+    use_pg = is_postgres()
     conn = get_db_connection()
     cur = conn.cursor()
-    if is_postgres():
+    if use_pg:
         query = query.replace("?", "%s")
     try:
-        cur.execute(query, params)
+        cur.execute(query, tuple(params))
         result = None
         if fetchone:
             row = cur.fetchone()
-            result = dict(row) if row else None
+            if row is not None:
+                if use_pg:
+                    cols = [col[0] for col in cur.description]
+                    result = dict(zip(cols, row))
+                else:
+                    result = dict(row)
         elif fetch:
             rows = cur.fetchall()
-            result = [dict(r) for r in rows]
+            if use_pg:
+                cols = [col[0] for col in cur.description]
+                result = [dict(zip(cols, r)) for r in rows]
+            else:
+                result = [dict(r) for r in rows]
         conn.commit()
         return result
     finally:
@@ -70,7 +97,7 @@ def init_db():
     """)
 
     # Tabela de Configuração do TeamSpeak 3
-    db_execute(f"""
+    db_execute("""
         CREATE TABLE IF NOT EXISTS ts_config (
             id INTEGER PRIMARY KEY,
             host VARCHAR(150) DEFAULT '',
@@ -179,10 +206,6 @@ def recv_until_prompt(sock):
     return buffer.decode("utf-8", errors="ignore")
 
 def fetch_ts3_online_clients(cfg):
-    """
-    Conecta via TCP no ServerQuery do TS3, autentica, seleciona a porta de voz,
-    filtra salas de AFK configuradas e retorna a lista de nicks online.
-    """
     host = (cfg.get("host") or "").strip()
     voice_port = int(cfg.get("voice_port") or 9987)
     query_port = int(cfg.get("query_port") or 10011)
@@ -199,10 +222,8 @@ def fetch_ts3_online_clients(cfg):
 
     try:
         sock.connect((host, query_port))
-        # Lê o banner inicial do TS3
         sock.recv(1024)
 
-        # 1. Login no ServerQuery (se usuário e senha informados)
         if user and password:
             cmd_login = f"login client_login_name={ts3_escape(user)} client_login_password={ts3_escape(password)}\n"
             sock.sendall(cmd_login.encode("utf-8"))
@@ -210,13 +231,11 @@ def fetch_ts3_online_clients(cfg):
             if "error id=0" not in resp_login:
                 return False, f"Falha no login do ServerQuery: {resp_login.strip()}"
 
-        # 2. Seleciona o servidor virtual pela porta de voz
         sock.sendall(f"use port={voice_port}\n".encode("utf-8"))
         resp_use = recv_until_prompt(sock)
         if "error id=0" not in resp_use:
             return False, f"Erro ao selecionar porta de voz {voice_port}: {resp_use.strip()}"
 
-        # 3. Busca lista de salas para mapear canais ignorados (AFK/Ausente)
         ignored_channel_ids = set()
         if ignore_keywords:
             sock.sendall(b"channellist\n")
@@ -234,7 +253,6 @@ def fetch_ts3_online_clients(cfg):
                         if cid and any(kw in cname for kw in ignore_keywords):
                             ignored_channel_ids.add(cid)
 
-        # 4. Busca todos os clientes conectados
         sock.sendall(b"clientlist\n")
         resp_clients = recv_until_prompt(sock)
         if "error id=0" not in resp_clients:
@@ -251,7 +269,6 @@ def fetch_ts3_online_clients(cfg):
                         if "=" in part:
                             k, v = part.split("=", 1)
                             props[k] = ts3_unescape(v)
-                    # client_type == '0' garante apenas jogadores de voz (ignora bots de query)
                     if props.get("client_type") == "0":
                         nick = props.get("client_nickname", "").strip()
                         cid = props.get("cid")
@@ -274,10 +291,6 @@ def fetch_ts3_online_clients(cfg):
         sock.close()
 
 def match_player_nick(registered_nick, ts_online_nicks):
-    """
-    Verifica se o nick cadastrado bate com algum nick online no TS3.
-    Aceita correspondência exata ou tag de clã (ex: cadastrado 'Hunter' bate com '[CLAN] Hunter').
-    """
     reg_clean = registered_nick.strip().lower()
     if not reg_clean:
         return None
@@ -338,7 +351,6 @@ def dashboard():
     tab = request.args.get("tab", "eventos")
     selected_event_id = request.args.get("event_id", type=int)
 
-    # Dados gerais
     users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
     events = db_execute("SELECT * FROM events ORDER BY id DESC", fetch=True)
     ts_cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
@@ -346,7 +358,6 @@ def dashboard():
     if not selected_event_id and events:
         selected_event_id = events[0]["id"]
 
-    # Detalhes do evento selecionado
     selected_event = None
     event_attendance = {}
     if selected_event_id:
@@ -355,13 +366,12 @@ def dashboard():
         for r in rows:
             event_attendance[r["user_id"]] = r
 
-    # Estatísticas de presença por jogador
     total_events = len(events)
     all_att = db_execute("SELECT user_id, COUNT(*) as cnt FROM attendance GROUP BY user_id", fetch=True)
-    att_counts = {r["user_id"]: r["cnt"] for r in all_att}
+    att_counts = {r["user_id"]: int(r["cnt"]) for r in all_att}
 
     all_drops_won = db_execute("SELECT winner_user_id, SUM(quantity) as cnt FROM drops WHERE winner_user_id IS NOT NULL GROUP BY winner_user_id", fetch=True)
-    drop_counts = {r["winner_user_id"]: r["cnt"] for r in all_drops_won}
+    drop_counts = {r["winner_user_id"]: int(r["cnt"]) for r in all_drops_won}
 
     for u in users:
         presences = att_counts.get(u["id"], 0)
@@ -369,7 +379,6 @@ def dashboard():
         u["pct"] = round((presences / total_events) * 100, 1) if total_events > 0 else 0.0
         u["drops_won"] = drop_counts.get(u["id"], 0)
 
-    # Lista de Drops com join de nomes
     drops = db_execute("""
         SELECT d.*, u.username as winner_name, u.ts_nick as winner_nick, e.title as event_title
         FROM drops d
@@ -387,10 +396,10 @@ def dashboard():
         event_attendance=event_attendance,
         ts_cfg=ts_cfg,
         drops=drops,
-        total_events=total_events
+        total_events=total_events,
+        db_mode="PostgreSQL (Railway)" if is_postgres() else "SQLite Local"
     )
 
-# --- ROTAS DE EVENTOS E CHAMADA TS3 ---
 @app.route("/events/create", methods=["POST"])
 @admin_required
 def create_event():
@@ -458,7 +467,6 @@ def sync_event_ts3(event_id):
 @app.route("/events/<int:event_id>/manual_paste", methods=["POST"])
 @admin_required
 def manual_paste_ts3(event_id):
-    """Contingência caso o servidor TS3 bloqueie a porta Query externa: permite colar os nicks da sala."""
     raw_text = request.form.get("raw_nicks", "")
     lines = [l.strip() for l in raw_text.replace(",", "\n").splitlines() if l.strip()]
     users = db_execute("SELECT * FROM users", fetch=True)
@@ -501,7 +509,6 @@ def toggle_attendance(event_id, user_id):
         )
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
-# --- ROTAS DE JOGADORES (CRIAR / EXCLUIR / EDITAR) ---
 @app.route("/users/create", methods=["POST"])
 @admin_required
 def create_user():
@@ -556,7 +563,6 @@ def update_profile():
     flash("Seus dados foram atualizados com sucesso!", "success")
     return redirect(url_for("dashboard", tab="perfil"))
 
-# --- ROTAS DO MÓDULO DE DROPS (ITENS) ---
 @app.route("/drops/create", methods=["POST"])
 @admin_required
 def create_drop():
@@ -584,7 +590,7 @@ def create_drop():
 @admin_required
 def assign_drop(drop_id):
     winner_user_id = request.form.get("winner_user_id")
-    status = request.form.get("status", "Entregue")
+    status = request.form.get("status", "Entregue ao Player")
     win_val = int(winner_user_id) if winner_user_id and winner_user_id.isdigit() else None
     db_execute(
         "UPDATE drops SET winner_user_id = ?, status = ? WHERE id = ?",
@@ -600,7 +606,6 @@ def delete_drop(drop_id):
     flash("Item removido da lista de Drops.", "info")
     return redirect(url_for("dashboard", tab="drops"))
 
-# --- ROTAS DE CONFIGURAÇÃO DO TS3 ---
 @app.route("/tsconfig/save", methods=["POST"])
 @admin_required
 def save_tsconfig():
@@ -632,7 +637,7 @@ def save_tsconfig():
     return redirect(url_for("dashboard", tab="tsconfig"))
 
 # ==========================================
-# TEMPLATES HTML EMBUTIDOS (DARK GAMING UI)
+# TEMPLATES HTML EMBUTIDOS
 # ==========================================
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -740,6 +745,9 @@ MAIN_HTML = """
     <div class="container-fluid">
         <a class="navbar-brand fw-bold d-flex align-items-center gap-2" href="{{ url_for('dashboard') }}">
             <i class="fa-solid fa-headset text-primary"></i> TS3 Guild Tracker
+            <span class="badge {% if 'PostgreSQL' in db_mode %}bg-success{% else %}bg-warning text-dark{% endif %} ms-2" style="font-size: 0.7rem;">
+                <i class="fa-solid fa-database me-1"></i>{{ db_mode }}
+            </span>
         </a>
         <div class="d-flex align-items-center gap-3">
             <span class="small text-secondary">
@@ -770,7 +778,6 @@ MAIN_HTML = """
       {% endif %}
     {% endwith %}
 
-    <!-- MENU DE NAVEGAÇÃO POR ABAS -->
     <ul class="nav nav-pills gap-2 mb-4">
         <li class="nav-item">
             <a class="nav-link {% if tab == 'eventos' %}active{% endif %}" href="{{ url_for('dashboard', tab='eventos') }}">
@@ -801,12 +808,8 @@ MAIN_HTML = """
         </li>
     </ul>
 
-    <!-- ==========================================
-         ABA 1: EVENTOS & CHAMADA NO TS3
-         ========================================== -->
     {% if tab == 'eventos' %}
     <div class="row g-4">
-        <!-- Coluna lateral: Lista de Eventos e Criar Evento -->
         <div class="col-lg-4">
             {% if session['role'] == 'admin' %}
             <div class="card p-3 mb-3">
@@ -853,7 +856,6 @@ MAIN_HTML = """
             </div>
         </div>
 
-        <!-- Coluna Principal: Painel de Chamada do Evento Selecionado -->
         <div class="col-lg-8">
             {% if selected_event %}
             <div class="card p-4">
@@ -934,13 +936,9 @@ MAIN_HTML = """
                                 <td class="text-end">
                                     <form method="POST" action="{{ url_for('toggle_attendance', event_id=selected_event.id, user_id=u.id) }}" class="d-inline">
                                         {% if att %}
-                                            <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Remover presença">
-                                                Remover
-                                            </button>
+                                            <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2">Remover</button>
                                         {% else %}
-                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Marcar presença manual">
-                                                + Presença
-                                            </button>
+                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2">+ Presença</button>
                                         {% endif %}
                                     </form>
                                 </td>
@@ -962,9 +960,6 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 2: MÓDULO DE DROPS (ITENS)
-         ========================================== -->
     {% if tab == 'drops' %}
     <div class="row g-4">
         {% if session['role'] == 'admin' %}
@@ -1110,9 +1105,6 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 3: JOGADORES (CRIAR / EXCLUIR / RANKING)
-         ========================================== -->
     {% if tab == 'players' %}
     <div class="row g-4">
         {% if session['role'] == 'admin' %}
@@ -1131,9 +1123,6 @@ MAIN_HTML = """
                     <div class="mb-2">
                         <label class="form-label small text-secondary mb-1">Nick Exato no TeamSpeak 3</label>
                         <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Jefferson (sem precisar da tag)" required>
-                        <div class="form-text text-secondary" style="font-size: 0.72rem;">
-                            O sistema reconhece mesmo se ele usar tag antes do nome no TS3 (ex: <code>[CLAN] Jefferson</code>).
-                        </div>
                     </div>
                     <div class="mb-3">
                         <label class="form-label small text-secondary mb-1">Permissão no Site</label>
@@ -1211,9 +1200,6 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 4: CONFIGURAÇÃO DO TEAMSPEAK 3 (ADMIN)
-         ========================================== -->
     {% if tab == 'tsconfig' and session['role'] == 'admin' %}
     <div class="row justify-content-center">
         <div class="col-lg-7">
@@ -1253,9 +1239,6 @@ MAIN_HTML = """
                     <div class="mb-4">
                         <label class="form-label small text-secondary">Ignorar Salas com estes Nomes (separados por vírgula)</label>
                         <input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary" placeholder="Ex: AFK, Ausente, Away">
-                        <div class="form-text text-secondary small">
-                            Quem estiver em uma sala que contenha qualquer uma dessas palavras não ganhará presença automática.
-                        </div>
                     </div>
 
                     <div class="d-flex gap-2">
@@ -1272,9 +1255,6 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 5: MEU PERFIL (PLAYER / ADMIN)
-         ========================================== -->
     {% if tab == 'perfil' %}
     <div class="row justify-content-center">
         <div class="col-lg-5">
