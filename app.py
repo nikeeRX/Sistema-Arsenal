@@ -1,574 +1,1314 @@
 import os
-import smtplib
-import psycopg2
-import base64
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from flask import Flask, render_template_string, request, redirect, url_for
+import socket
+import sqlite3
+from datetime import datetime
+from functools import wraps
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash
+from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "ts3_guild_tracker_secret_key_2026")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # ==========================================
-# 1. CONFIGURAÇÃO DO BANCO DE DADOS
+# CAMADA DE BANCO DE DADOS (POSTGRES / SQLITE)
 # ==========================================
-DATABASE_URL = "postgresql://postgres:ZoLVFMMKvRQxFhFpTApEqmESiNdQpCOy@acela.proxy.rlwy.net:19268/railway"
+def is_postgres():
+    return bool(DATABASE_URL and psycopg2)
 
 def get_db_connection():
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
+    if is_postgres():
+        db_url = DATABASE_URL
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+    else:
+        conn = sqlite3.connect("guild_tracker.db")
+        conn.row_factory = sqlite3.Row
         return conn
-    except Exception as e:
-        print(f"Erro ao conectar: {e}")
-        return None
 
-def iniciar_banco():
+def db_execute(query, params=(), fetch=False, fetchone=False):
     conn = get_db_connection()
-    if conn is None: return
     cur = conn.cursor()
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id SERIAL PRIMARY KEY, nome VARCHAR(100) NOT NULL, cpf VARCHAR(14) UNIQUE,
-            email VARCHAR(100) UNIQUE, contato VARCHAR(20), senha VARCHAR(100),
-            tipo_perfil VARCHAR(50) NOT NULL, status VARCHAR(20) DEFAULT 'pendente'
-        );
-        CREATE TABLE IF NOT EXISTS planos_de_acao (
-            id SERIAL PRIMARY KEY, paciente_id INTEGER REFERENCES usuarios(id),
-            psicologa_id INTEGER REFERENCES usuarios(id), plano TEXT, exercicios TEXT,
-            metas TEXT, recomendacoes TEXT, data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS recados_gerais (
-            id SERIAL PRIMARY KEY, autor_id INTEGER REFERENCES usuarios(id),
-            tipo VARCHAR(50) DEFAULT 'Aviso', mensagem TEXT, data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS agenda (
-            id SERIAL PRIMARY KEY, psicologa_id INTEGER REFERENCES usuarios(id),
-            paciente_id INTEGER REFERENCES usuarios(id), data_hora TIMESTAMP,
-            status_sessao VARCHAR(50) DEFAULT 'Agendado'
-        );
-        CREATE TABLE IF NOT EXISTS financeiro (
-            id SERIAL PRIMARY KEY, paciente_id INTEGER REFERENCES usuarios(id),
-            psicologa_id INTEGER REFERENCES usuarios(id), data_cobranca DATE,
-            valor DECIMAL(10,2), status_pagamento VARCHAR(20) DEFAULT 'Pendente'
-        );
-        CREATE TABLE IF NOT EXISTS mensagens (
-            id SERIAL PRIMARY KEY, remetente_id INTEGER REFERENCES usuarios(id),
-            destinatario_id INTEGER REFERENCES usuarios(id), conteudo TEXT,
-            data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS notificacoes_popup (
-            id SERIAL PRIMARY KEY, usuario_id INTEGER REFERENCES usuarios(id),
-            mensagem TEXT, lida BOOLEAN DEFAULT FALSE
-        );
-        CREATE TABLE IF NOT EXISTS diario_emocional (
-            id SERIAL PRIMARY KEY, paciente_id INTEGER REFERENCES usuarios(id),
-            humor VARCHAR(50), nota_texto TEXT, data_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
-    
-    colunas_novas = ["crp VARCHAR(50)", "foto TEXT", "psicologa_id INTEGER REFERENCES usuarios(id)"]
-    for col in colunas_novas:
-        try: cur.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col};")
-        except: pass
-
-    try: cur.execute("ALTER TABLE agenda ALTER COLUMN status_sessao TYPE VARCHAR(50);")
-    except: pass
-
-    cur.execute("SELECT COUNT(*) FROM usuarios WHERE tipo_perfil = 'admin';")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO usuarios (nome, email, senha, tipo_perfil, status) VALUES ('Administrador Principal', 'admin@serperene.com', 'admin123', 'admin', 'ativo');")
-    
-    conn.commit()
-    cur.close(); conn.close()
-
-# ==========================================
-# 2. SISTEMA DE E-MAIL
-# ==========================================
-def enviar_email_boas_vindas(destinatario, nome_paciente):
-    remetente = os.getenv("EMAIL_CLINICA", "nao-configurado")
-    senha = os.getenv("SENHA_EMAIL_CLINICA", "nao-configurado")
-    if remetente == "nao-configurado": return
-    
-    msg = MIMEMultipart()
-    msg['From'] = remetente
-    msg['To'] = destinatario
-    msg['Subject'] = "Bem-vindo(a) à Ser Perene"
-    msg.attach(MIMEText(f"Olá, {nome_paciente}!\n\nSeu cadastro foi recebido com sucesso e está em análise. Você receberá um aviso assim que for liberado.", 'plain'))
-    
+    if is_postgres():
+        query = query.replace("?", "%s")
     try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(remetente, senha)
-        server.sendmail(remetente, destinatario, msg.as_string())
-        server.quit()
-    except Exception as e: print(e)
+        cur.execute(query, params)
+        result = None
+        if fetchone:
+            row = cur.fetchone()
+            result = dict(row) if row else None
+        elif fetch:
+            rows = cur.fetchall()
+            result = [dict(r) for r in rows]
+        conn.commit()
+        return result
+    finally:
+        cur.close()
+        conn.close()
+
+def init_db():
+    id_col = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    
+    # Tabela de Usuários (Admin e Players)
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS users (
+            id {id_col},
+            username VARCHAR(80) UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            ts_nick VARCHAR(120) NOT NULL,
+            role VARCHAR(20) DEFAULT 'player',
+            created_at VARCHAR(40)
+        )
+    """)
+
+    # Tabela de Configuração do TeamSpeak 3
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS ts_config (
+            id INTEGER PRIMARY KEY,
+            host VARCHAR(150) DEFAULT '',
+            voice_port INTEGER DEFAULT 9987,
+            query_port INTEGER DEFAULT 10011,
+            query_user VARCHAR(100) DEFAULT 'serveradmin',
+            query_pass VARCHAR(150) DEFAULT '',
+            ignore_channels TEXT DEFAULT 'AFK,Ausente'
+        )
+    """)
+
+    # Tabela de Eventos (Chamadas)
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS events (
+            id {id_col},
+            title VARCHAR(150) NOT NULL,
+            event_type VARCHAR(80) DEFAULT 'Guerra / Boss',
+            status VARCHAR(30) DEFAULT 'Aberto',
+            created_at VARCHAR(40),
+            last_sync VARCHAR(40) DEFAULT 'Nunca'
+        )
+    """)
+
+    # Tabela de Presenças Contabilizadas
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id {id_col},
+            event_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            ts_nick_found VARCHAR(150),
+            method VARCHAR(50) DEFAULT 'TS3 Auto',
+            checked_at VARCHAR(40),
+            UNIQUE(event_id, user_id)
+        )
+    """)
+
+    # Tabela de Drops / Itens
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS drops (
+            id {id_col},
+            item_name VARCHAR(150) NOT NULL,
+            rarity VARCHAR(50) DEFAULT 'Raro',
+            quantity INTEGER DEFAULT 1,
+            boss_source VARCHAR(120) DEFAULT '',
+            event_id INTEGER,
+            winner_user_id INTEGER,
+            status VARCHAR(50) DEFAULT 'Banco do Clã',
+            created_at VARCHAR(40)
+        )
+    """)
+
+    # Garantir configuração inicial do TS3
+    cfg = db_execute("SELECT id FROM ts_config WHERE id = 1", fetchone=True)
+    if not cfg:
+        db_execute("""
+            INSERT INTO ts_config (id, host, voice_port, query_port, query_user, query_pass, ignore_channels)
+            VALUES (1, '', 9987, 10011, 'serveradmin', '', 'AFK,Ausente')
+        """)
+
+    # Garantir usuário Admin padrão (login: admin / senha: admin123)
+    admin = db_execute("SELECT id FROM users WHERE username = ?", ("admin",), fetchone=True)
+    if not admin:
+        db_execute("""
+            INSERT INTO users (username, password_hash, ts_nick, role, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            "admin",
+            generate_password_hash("admin123"),
+            "AdminTS",
+            "admin",
+            datetime.now().strftime("%d/%m/%Y %H:%M")
+        ))
+
+init_db()
 
 # ==========================================
-# 3. FRONT-END HTML BASE
+# INTEGRAÇÃO NATIVA TEAMSPEAK 3 SERVERQUERY
 # ==========================================
-TEMPLATE_UNICO = """
+def ts3_escape(text):
+    if not text:
+        return ""
+    return (str(text)
+            .replace("\\", "\\\\")
+            .replace("/", "\\/")
+            .replace(" ", "\\s")
+            .replace("|", "\\p"))
+
+def ts3_unescape(text):
+    if not text:
+        return ""
+    return (str(text)
+            .replace("\\s", " ")
+            .replace("\\/", "/")
+            .replace("\\p", "|")
+            .replace("\\\\", "\\"))
+
+def recv_until_prompt(sock):
+    buffer = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buffer += chunk
+        if b"error id=" in buffer:
+            break
+    return buffer.decode("utf-8", errors="ignore")
+
+def fetch_ts3_online_clients(cfg):
+    """
+    Conecta via TCP no ServerQuery do TS3, autentica, seleciona a porta de voz,
+    filtra salas de AFK configuradas e retorna a lista de nicks online.
+    """
+    host = (cfg.get("host") or "").strip()
+    voice_port = int(cfg.get("voice_port") or 9987)
+    query_port = int(cfg.get("query_port") or 10011)
+    user = (cfg.get("query_user") or "").strip()
+    password = (cfg.get("query_pass") or "").strip()
+    ignore_raw = (cfg.get("ignore_channels") or "").split(",")
+    ignore_keywords = [k.strip().lower() for k in ignore_raw if k.strip()]
+
+    if not host:
+        return False, "Host/IP do TeamSpeak 3 não configurado no painel."
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(8.0)
+
+    try:
+        sock.connect((host, query_port))
+        # Lê o banner inicial do TS3
+        sock.recv(1024)
+
+        # 1. Login no ServerQuery (se usuário e senha informados)
+        if user and password:
+            cmd_login = f"login client_login_name={ts3_escape(user)} client_login_password={ts3_escape(password)}\n"
+            sock.sendall(cmd_login.encode("utf-8"))
+            resp_login = recv_until_prompt(sock)
+            if "error id=0" not in resp_login:
+                return False, f"Falha no login do ServerQuery: {resp_login.strip()}"
+
+        # 2. Seleciona o servidor virtual pela porta de voz
+        sock.sendall(f"use port={voice_port}\n".encode("utf-8"))
+        resp_use = recv_until_prompt(sock)
+        if "error id=0" not in resp_use:
+            return False, f"Erro ao selecionar porta de voz {voice_port}: {resp_use.strip()}"
+
+        # 3. Busca lista de salas para mapear canais ignorados (AFK/Ausente)
+        ignored_channel_ids = set()
+        if ignore_keywords:
+            sock.sendall(b"channellist\n")
+            resp_channels = recv_until_prompt(sock)
+            for line in resp_channels.splitlines():
+                if "cid=" in line:
+                    for item in line.split("|"):
+                        props = {}
+                        for part in item.split(" "):
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                props[k] = ts3_unescape(v)
+                        cid = props.get("cid")
+                        cname = (props.get("channel_name") or "").lower()
+                        if cid and any(kw in cname for kw in ignore_keywords):
+                            ignored_channel_ids.add(cid)
+
+        # 4. Busca todos os clientes conectados
+        sock.sendall(b"clientlist\n")
+        resp_clients = recv_until_prompt(sock)
+        if "error id=0" not in resp_clients:
+            return False, f"Permissão negada ou erro ao rodar clientlist: {resp_clients.strip()}"
+
+        online_nicks = []
+        skipped_afk = []
+
+        for line in resp_clients.splitlines():
+            if "clid=" in line:
+                for item in line.split("|"):
+                    props = {}
+                    for part in item.split(" "):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            props[k] = ts3_unescape(v)
+                    # client_type == '0' garante apenas jogadores de voz (ignora bots de query)
+                    if props.get("client_type") == "0":
+                        nick = props.get("client_nickname", "").strip()
+                        cid = props.get("cid")
+                        if nick:
+                            if cid in ignored_channel_ids:
+                                skipped_afk.append(nick)
+                            else:
+                                online_nicks.append(nick)
+
+        try:
+            sock.sendall(b"quit\n")
+        except Exception:
+            pass
+
+        return True, {"online": online_nicks, "afk": skipped_afk}
+
+    except Exception as e:
+        return False, f"Erro de conexão com o TS3 ({host}:{query_port}): {str(e)}"
+    finally:
+        sock.close()
+
+def match_player_nick(registered_nick, ts_online_nicks):
+    """
+    Verifica se o nick cadastrado bate com algum nick online no TS3.
+    Aceita correspondência exata ou tag de clã (ex: cadastrado 'Hunter' bate com '[CLAN] Hunter').
+    """
+    reg_clean = registered_nick.strip().lower()
+    if not reg_clean:
+        return None
+    for online in ts_online_nicks:
+        on_clean = online.strip().lower()
+        if reg_clean == on_clean or reg_clean in on_clean:
+            return online
+    return None
+
+# ==========================================
+# DECORATORS DE AUTENTICAÇÃO
+# ==========================================
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        if session.get("role") != "admin":
+            flash("Acesso restrito para Administradores.", "danger")
+            return redirect(url_for("dashboard"))
+        return f(*args, **kwargs)
+    return decorated
+
+# ==========================================
+# ROTAS DO SISTEMA
+# ==========================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        user = db_execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["ts_nick"] = user["ts_nick"]
+            session["role"] = user["role"]
+            return redirect(url_for("dashboard"))
+        flash("Login ou senha incorretos.", "danger")
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/")
+@login_required
+def dashboard():
+    tab = request.args.get("tab", "eventos")
+    selected_event_id = request.args.get("event_id", type=int)
+
+    # Dados gerais
+    users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
+    events = db_execute("SELECT * FROM events ORDER BY id DESC", fetch=True)
+    ts_cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
+
+    if not selected_event_id and events:
+        selected_event_id = events[0]["id"]
+
+    # Detalhes do evento selecionado
+    selected_event = None
+    event_attendance = {}
+    if selected_event_id:
+        selected_event = db_execute("SELECT * FROM events WHERE id = ?", (selected_event_id,), fetchone=True)
+        rows = db_execute("SELECT * FROM attendance WHERE event_id = ?", (selected_event_id,), fetch=True)
+        for r in rows:
+            event_attendance[r["user_id"]] = r
+
+    # Estatísticas de presença por jogador
+    total_events = len(events)
+    all_att = db_execute("SELECT user_id, COUNT(*) as cnt FROM attendance GROUP BY user_id", fetch=True)
+    att_counts = {r["user_id"]: r["cnt"] for r in all_att}
+
+    all_drops_won = db_execute("SELECT winner_user_id, SUM(quantity) as cnt FROM drops WHERE winner_user_id IS NOT NULL GROUP BY winner_user_id", fetch=True)
+    drop_counts = {r["winner_user_id"]: r["cnt"] for r in all_drops_won}
+
+    for u in users:
+        presences = att_counts.get(u["id"], 0)
+        u["presences"] = presences
+        u["pct"] = round((presences / total_events) * 100, 1) if total_events > 0 else 0.0
+        u["drops_won"] = drop_counts.get(u["id"], 0)
+
+    # Lista de Drops com join de nomes
+    drops = db_execute("""
+        SELECT d.*, u.username as winner_name, u.ts_nick as winner_nick, e.title as event_title
+        FROM drops d
+        LEFT JOIN users u ON d.winner_user_id = u.id
+        LEFT JOIN events e ON d.event_id = e.id
+        ORDER BY d.id DESC
+    """, fetch=True)
+
+    return render_template_string(
+        MAIN_HTML,
+        tab=tab,
+        users=users,
+        events=events,
+        selected_event=selected_event,
+        event_attendance=event_attendance,
+        ts_cfg=ts_cfg,
+        drops=drops,
+        total_events=total_events
+    )
+
+# --- ROTAS DE EVENTOS E CHAMADA TS3 ---
+@app.route("/events/create", methods=["POST"])
+@admin_required
+def create_event():
+    title = request.form.get("title", "").strip()
+    event_type = request.form.get("event_type", "Guerra / Boss").strip()
+    if title:
+        now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+        db_execute(
+            "INSERT INTO events (title, event_type, status, created_at) VALUES (?, ?, 'Aberto', ?)",
+            (title, event_type, now_str)
+        )
+        flash(f"Evento '{title}' criado! Agora você já pode puxar a presença do TS3.", "success")
+    return redirect(url_for("dashboard", tab="eventos"))
+
+@app.route("/events/<int:event_id>/delete", methods=["POST"])
+@admin_required
+def delete_event(event_id):
+    db_execute("DELETE FROM attendance WHERE event_id = ?", (event_id,))
+    db_execute("UPDATE drops SET event_id = NULL WHERE event_id = ?", (event_id,))
+    db_execute("DELETE FROM events WHERE id = ?", (event_id,))
+    flash("Evento excluído com sucesso.", "info")
+    return redirect(url_for("dashboard", tab="eventos"))
+
+@app.route("/events/<int:event_id>/sync_ts3", methods=["POST"])
+@admin_required
+def sync_event_ts3(event_id):
+    cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
+    ok, result = fetch_ts3_online_clients(cfg)
+    if not ok:
+        flash(result, "danger")
+        return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
+
+    online_nicks = result["online"]
+    afk_nicks = result["afk"]
+    users = db_execute("SELECT * FROM users", fetch=True)
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    matched_count = 0
+    for u in users:
+        found_nick = match_player_nick(u["ts_nick"], online_nicks)
+        if found_nick:
+            matched_count += 1
+            existing = db_execute(
+                "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
+                (event_id, u["id"]), fetchone=True
+            )
+            if existing:
+                db_execute(
+                    "UPDATE attendance SET ts_nick_found = ?, method = 'TS3 Auto', checked_at = ? WHERE id = ?",
+                    (found_nick, now_str, existing["id"])
+                )
+            else:
+                db_execute(
+                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'TS3 Auto', ?)",
+                    (event_id, u["id"], found_nick, now_str)
+                )
+
+    db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
+    msg = f"Varredura TS3 concluída! {len(online_nicks)} online no TS3 | {matched_count} jogadores cadastrados marcados com presença."
+    if afk_nicks:
+        msg += f" ({len(afk_nicks)} ignorados em sala AFK)."
+    flash(msg, "success")
+    return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
+
+@app.route("/events/<int:event_id>/manual_paste", methods=["POST"])
+@admin_required
+def manual_paste_ts3(event_id):
+    """Contingência caso o servidor TS3 bloqueie a porta Query externa: permite colar os nicks da sala."""
+    raw_text = request.form.get("raw_nicks", "")
+    lines = [l.strip() for l in raw_text.replace(",", "\n").splitlines() if l.strip()]
+    users = db_execute("SELECT * FROM users", fetch=True)
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    matched_count = 0
+    for u in users:
+        found_nick = match_player_nick(u["ts_nick"], lines)
+        if found_nick:
+            matched_count += 1
+            existing = db_execute(
+                "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
+                (event_id, u["id"]), fetchone=True
+            )
+            if not existing:
+                db_execute(
+                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'Lista TS3', ?)",
+                    (event_id, u["id"], found_nick, now_str)
+                )
+
+    db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
+    flash(f"{matched_count} presenças contabilizadas a partir da lista de nicks!", "success")
+    return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
+
+@app.route("/events/<int:event_id>/toggle_user/<int:user_id>", methods=["POST"])
+@admin_required
+def toggle_attendance(event_id, user_id):
+    existing = db_execute(
+        "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
+        (event_id, user_id), fetchone=True
+    )
+    if existing:
+        db_execute("DELETE FROM attendance WHERE id = ?", (existing["id"],))
+    else:
+        u = db_execute("SELECT ts_nick FROM users WHERE id = ?", (user_id,), fetchone=True)
+        now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        db_execute(
+            "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'Manual Admin', ?)",
+            (event_id, user_id, u["ts_nick"] if u else "Manual", now_str)
+        )
+    return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
+
+# --- ROTAS DE JOGADORES (CRIAR / EXCLUIR / EDITAR) ---
+@app.route("/users/create", methods=["POST"])
+@admin_required
+def create_user():
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "").strip()
+    ts_nick = request.form.get("ts_nick", "").strip()
+    role = request.form.get("role", "player").strip()
+
+    if not username or not password or not ts_nick:
+        flash("Preencha Login, Senha e Nick do TS3.", "warning")
+        return redirect(url_for("dashboard", tab="players"))
+
+    exists = db_execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
+    if exists:
+        flash(f"O login '{username}' já está cadastrado.", "danger")
+        return redirect(url_for("dashboard", tab="players"))
+
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    db_execute(
+        "INSERT INTO users (username, password_hash, ts_nick, role, created_at) VALUES (?, ?, ?, ?, ?)",
+        (username, generate_password_hash(password), ts_nick, role, now_str)
+    )
+    flash(f"Jogador '{username}' (Nick TS3: {ts_nick}) criado com sucesso!", "success")
+    return redirect(url_for("dashboard", tab="players"))
+
+@app.route("/users/<int:user_id>/delete", methods=["POST"])
+@admin_required
+def delete_user(user_id):
+    if user_id == session.get("user_id"):
+        flash("Você não pode excluir sua própria conta logada.", "warning")
+        return redirect(url_for("dashboard", tab="players"))
+
+    db_execute("DELETE FROM attendance WHERE user_id = ?", (user_id,))
+    db_execute("UPDATE drops SET winner_user_id = NULL WHERE winner_user_id = ?", (user_id,))
+    db_execute("DELETE FROM users WHERE id = ?", (user_id,))
+    flash("Jogador excluído do sistema.", "info")
+    return redirect(url_for("dashboard", tab="players"))
+
+@app.route("/profile/update", methods=["POST"])
+@login_required
+def update_profile():
+    new_ts_nick = request.form.get("ts_nick", "").strip()
+    new_pass = request.form.get("new_password", "").strip()
+    uid = session["user_id"]
+
+    if new_ts_nick:
+        db_execute("UPDATE users SET ts_nick = ? WHERE id = ?", (new_ts_nick, uid))
+        session["ts_nick"] = new_ts_nick
+    if new_pass:
+        db_execute("UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(new_pass), uid))
+
+    flash("Seus dados foram atualizados com sucesso!", "success")
+    return redirect(url_for("dashboard", tab="perfil"))
+
+# --- ROTAS DO MÓDULO DE DROPS (ITENS) ---
+@app.route("/drops/create", methods=["POST"])
+@admin_required
+def create_drop():
+    item_name = request.form.get("item_name", "").strip()
+    rarity = request.form.get("rarity", "Raro").strip()
+    quantity = int(request.form.get("quantity") or 1)
+    boss_source = request.form.get("boss_source", "").strip()
+    event_id = request.form.get("event_id")
+    winner_user_id = request.form.get("winner_user_id")
+    status = request.form.get("status", "Banco do Clã").strip()
+
+    ev_val = int(event_id) if event_id and event_id.isdigit() else None
+    win_val = int(winner_user_id) if winner_user_id and winner_user_id.isdigit() else None
+
+    if item_name:
+        now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+        db_execute("""
+            INSERT INTO drops (item_name, rarity, quantity, boss_source, event_id, winner_user_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (item_name, rarity, quantity, boss_source, ev_val, win_val, status, now_str))
+        flash(f"Drop '{item_name}' (x{quantity}) registrado com sucesso!", "success")
+    return redirect(url_for("dashboard", tab="drops"))
+
+@app.route("/drops/<int:drop_id>/assign", methods=["POST"])
+@admin_required
+def assign_drop(drop_id):
+    winner_user_id = request.form.get("winner_user_id")
+    status = request.form.get("status", "Entregue")
+    win_val = int(winner_user_id) if winner_user_id and winner_user_id.isdigit() else None
+    db_execute(
+        "UPDATE drops SET winner_user_id = ?, status = ? WHERE id = ?",
+        (win_val, status, drop_id)
+    )
+    flash("Destino do Drop atualizado!", "success")
+    return redirect(url_for("dashboard", tab="drops"))
+
+@app.route("/drops/<int:drop_id>/delete", methods=["POST"])
+@admin_required
+def delete_drop(drop_id):
+    db_execute("DELETE FROM drops WHERE id = ?", (drop_id,))
+    flash("Item removido da lista de Drops.", "info")
+    return redirect(url_for("dashboard", tab="drops"))
+
+# --- ROTAS DE CONFIGURAÇÃO DO TS3 ---
+@app.route("/tsconfig/save", methods=["POST"])
+@admin_required
+def save_tsconfig():
+    host = request.form.get("host", "").strip()
+    voice_port = int(request.form.get("voice_port") or 9987)
+    query_port = int(request.form.get("query_port") or 10011)
+    query_user = request.form.get("query_user", "").strip()
+    query_pass = request.form.get("query_pass", "").strip()
+    ignore_channels = request.form.get("ignore_channels", "").strip()
+
+    db_execute("""
+        UPDATE ts_config
+        SET host = ?, voice_port = ?, query_port = ?, query_user = ?, query_pass = ?, ignore_channels = ?
+        WHERE id = 1
+    """, (host, voice_port, query_port, query_user, query_pass, ignore_channels))
+
+    action = request.form.get("action", "save")
+    if action == "test":
+        cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
+        ok, res = fetch_ts3_online_clients(cfg)
+        if ok:
+            nicks_str = ", ".join(res["online"]) if res["online"] else "Nenhum cliente de voz conectado agora"
+            flash(f"Conexão TS3 OK! Online nas salas válidas ({len(res['online'])}): {nicks_str}", "success")
+        else:
+            flash(res, "danger")
+    else:
+        flash("Configurações do TeamSpeak 3 salvas com sucesso!", "success")
+
+    return redirect(url_for("dashboard", tab="tsconfig"))
+
+# ==========================================
+# TEMPLATES HTML EMBUTIDOS (DARK GAMING UI)
+# ==========================================
+LOGIN_HTML = """
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-br" data-bs-theme="dark">
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ser Perene - {{ titulo }}</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login - Painel TS3 & Drops</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Georgia', serif; }
-        body { background-color: #F4EBE9; color: #3A261D; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
-        header { width: 100%; background-color: #E8D5D0; padding: 20px; text-align: center; border-bottom: 2px solid #3A261D; }
-        header h1 { font-size: 2.5rem; font-weight: normal; }
-        .container { width: 90%; max-width: 800px; margin: 40px auto; }
-        .card { background-color: #FFFFFF; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(58, 38, 29, 0.1); border-left: 6px solid #3A261D; }
-        .card h2 { margin-bottom: 15px; font-size: 1.5rem; border-bottom: 1px solid #E8D5D0; padding-bottom: 10px; }
-        .card h3 { font-size: 1.1rem; margin-top: 15px; margin-bottom: 5px; color: #5c3e30;}
-        p, li { font-family: 'Arial', sans-serif; line-height: 1.6; font-size: 0.95rem; margin-bottom: 10px;}
-        label { font-family: 'Arial', sans-serif; font-weight: bold; font-size: 0.9rem; display: block; margin-top: 12px; }
-        input, select, textarea { width: 100%; padding: 12px; margin: 6px 0 16px 0; border: 1px solid #E8D5D0; border-radius: 6px; background-color: #F4EBE9; font-family: 'Arial', sans-serif; }
-        .btn { display: inline-block; background-color: #3A261D; color: #E8D5D0; padding: 12px 20px; text-decoration: none; border-radius: 6px; font-weight: bold; text-align: center; border: none; cursor: pointer; transition: 0.3s; width: 100%; font-family: 'Arial'; }
-        .btn-outline { background-color: transparent; color: #3A261D; border: 1px solid #3A261D; }
-        .btn-small { padding: 6px 12px; font-size: 0.8rem; width: auto; }
-        .sucesso { background-color: #d4edda; color: #155724; padding: 10px; border-radius: 6px; margin-bottom: 15px; text-align: center; font-family: 'Arial'; }
-        .erro { background-color: #ffcccc; color: #990000; padding: 10px; border-radius: 6px; margin-bottom: 15px; text-align: center; font-family: 'Arial'; }
-        .alerta { background-color: #E8D5D0; color: #3A261D; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; text-align: center; font-family: 'Arial'; }
-        .mensagem-box { background-color: #F9F4F3; padding: 15px; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid #E8D5D0; display: flex; justify-content: space-between; align-items: center; }
-        .data-msg { font-size: 0.75rem; color: #888; display: block; margin-top: 5px; font-family: 'Arial'; }
-        .foto-perfil { width: 50px; height: 50px; border-radius: 50%; object-fit: cover; vertical-align: middle; margin-right: 10px; border: 2px solid #3A261D; }
-        .link-cadastro { display: block; text-align: center; margin-top: 20px; font-family: 'Arial', sans-serif; color: #3A261D; text-decoration: none; font-size: 0.9rem; }
+        body {
+            background: radial-gradient(circle at top, #1a2238 0%, #0b0f19 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            background: #131926;
+            border: 1px solid #2a3550;
+            border-radius: 14px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.6);
+            width: 100%;
+            max-width: 410px;
+            padding: 2.2rem;
+        }
+        .brand-icon {
+            width: 64px;
+            height: 64px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.8rem;
+            margin: 0 auto 1rem;
+            color: #fff;
+        }
     </style>
 </head>
 <body>
-    <header><h1>serperene *</h1></header>
-    <div class="container">{{ conteudo | safe }}</div>
-    {{ script_popup | safe }}
+    <div class="login-card">
+        <div class="brand-icon"><i class="fa-solid fa-headset"></i></div>
+        <h4 class="text-center fw-bold mb-1">TS3 Guild Tracker</h4>
+        <p class="text-center text-secondary small mb-4">Controle de Presença TeamSpeak 3 & Drops</p>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for cat, msg in messages %}
+              <div class="alert alert-{{ cat }} py-2 small">{{ msg }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+
+        <form method="POST">
+            <div class="mb-3">
+                <label class="form-label small text-secondary">Login do Player / Admin</label>
+                <div class="input-group">
+                    <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-user"></i></span>
+                    <input type="text" name="username" class="form-control bg-dark text-light border-secondary" required autofocus>
+                </div>
+            </div>
+            <div class="mb-4">
+                <label class="form-label small text-secondary">Senha</label>
+                <div class="input-group">
+                    <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-lock"></i></span>
+                    <input type="password" name="password" class="form-control bg-dark text-light border-secondary" required>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary w-100 fw-semibold py-2">
+                <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar no Sistema
+            </button>
+        </form>
+    </div>
 </body>
 </html>
 """
 
-# ==========================================
-# 4. ROTAS DO APLICATIVO
-# ==========================================
+MAIN_HTML = """
+<!DOCTYPE html>
+<html lang="pt-br" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TS3 Guild Tracker - Presença & Drops</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #0b0f19; color: #e2e8f0; }
+        .navbar { background-color: #131926 !important; border-bottom: 1px solid #263147; }
+        .card { background-color: #131926; border: 1px solid #263147; border-radius: 12px; }
+        .nav-pills .nav-link { color: #94a3b8; border-radius: 8px; font-weight: 500; }
+        .nav-pills .nav-link.active { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
+        .badge-raridade-Comum { background-color: #475569; }
+        .badge-raridade-Raro { background-color: #0284c7; }
+        .badge-raridade-Épico { background-color: #7c3aed; }
+        .badge-raridade-Lendário { background-color: #d97706; color: #fff; }
+        .table-dark-custom th { background-color: #1a2234; color: #94a3b8; font-size: 0.82rem; text-transform: uppercase; }
+    </style>
+</head>
+<body>
 
-@app.route('/')
-def index():
-    html = """
-    <div class="card" style="max-width: 450px; margin: 0 auto; text-align: center;">
-        <h2 style="border: none;">Bem-vindo(a) à Clínica</h2>
-        <p style="margin-bottom: 25px; font-style: italic; color: #5c3e30;">Selecione o seu perfil para acessar o sistema:</p>
-        <a href="/login/paciente" class="btn" style="margin-bottom: 15px; padding: 15px; font-size: 1.1rem;">Sou Paciente</a>
-        <a href="/login/psicologa" class="btn" style="margin-bottom: 25px; padding: 15px; font-size: 1.1rem; background-color: #5c3e30;">Sou Psicóloga</a>
-        <hr style="border: 0; height: 1px; background-color: #E8D5D0; margin-bottom: 20px;">
-        <a href="/login/admin" class="btn btn-outline">Acesso Administrativo</a>
-    </div>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo="Início", conteudo=html, script_popup="")
-
-@app.route('/login/<perfil>', methods=['GET', 'POST'])
-def login(perfil):
-    if perfil not in ['paciente', 'psicologa', 'admin']: return redirect('/')
-    msg_erro = ""
-    if request.method == 'POST':
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, tipo_perfil, status FROM usuarios WHERE email=%s AND senha=%s AND tipo_perfil=%s LIMIT 1;", (request.form.get('email'), request.form.get('senha'), perfil))
-        user = cur.fetchone()
-        cur.close(); conn.close()
-        
-        if user:
-            if user[2] == 'pendente': msg_erro = "Seu cadastro está em análise pela clínica. Aguarde a liberação."
-            else: return redirect(url_for(f"area_{user[1]}", user_id=user[0]) if user[1] != 'admin' else url_for('area_admin'))
-        else: msg_erro = "E-mail ou senha incorretos, ou perfil inválido."
-
-    html_erro = f"<div class='erro'>{msg_erro}</div>" if msg_erro else ""
-    link_cad = f'<a href="/cadastro/paciente" class="link-cadastro">Primeiro acesso? <strong>Cadastre-se como Paciente aqui.</strong></a>' if perfil == 'paciente' else (f'<a href="/cadastro/psicologa" class="link-cadastro">Quer fazer parte da equipe? <strong>Solicite seu acesso aqui.</strong></a>' if perfil == 'psicologa' else '')
-
-    html = f"""
-    <div class="card" style="max-width: 400px; margin: 0 auto;">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h2 style="margin:0; border:none;">Login - {perfil.capitalize()}</h2>
-            <a href="/" style="color:#5c3e30; text-decoration:none; font-family:Arial; font-size:0.9rem;">Voltar</a>
+<nav class="navbar navbar-expand-lg navbar-dark px-3 py-2 mb-4">
+    <div class="container-fluid">
+        <a class="navbar-brand fw-bold d-flex align-items-center gap-2" href="{{ url_for('dashboard') }}">
+            <i class="fa-solid fa-headset text-primary"></i> TS3 Guild Tracker
+        </a>
+        <div class="d-flex align-items-center gap-3">
+            <span class="small text-secondary">
+                <i class="fa-solid fa-user-shield me-1 text-info"></i>
+                <strong>{{ session['username'] }}</strong>
+                <span class="badge bg-secondary ms-1">TS3: {{ session['ts_nick'] }}</span>
+                {% if session['role'] == 'admin' %}
+                    <span class="badge bg-primary ms-1">ADMIN</span>
+                {% endif %}
+            </span>
+            <a href="{{ url_for('logout') }}" class="btn btn-sm btn-outline-danger">
+                <i class="fa-solid fa-power-off"></i> Sair
+            </a>
         </div>
-        <hr style="border: 0; height: 1px; background-color: #E8D5D0; margin: 15px 0;">
-        {html_erro}
-        <form method="POST"><label>E-mail</label><input type="email" name="email" required><label>Senha</label><input type="password" name="senha" required><button type="submit" class="btn">Entrar na Conta</button></form>
-        {link_cad}
     </div>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo=f"Login {perfil.capitalize()}", conteudo=html, script_popup="")
+</nav>
 
-@app.route('/cadastro/<perfil>', methods=['GET', 'POST'])
-def cadastro(perfil):
-    if perfil not in ['paciente', 'psicologa']: return redirect('/')
-    conn = get_db_connection()
-    cur = conn.cursor()
+<div class="container pb-5">
 
-    if request.method == 'POST':
-        foto_b64 = None
-        if 'foto' in request.files:
-            foto_file = request.files['foto']
-            if foto_file.filename != '': foto_b64 = base64.b64encode(foto_file.read()).decode('utf-8')
-        psi_id = request.form.get('psicologa_id')
-        psi_id = psi_id if psi_id and psi_id.strip() != "" else None
-        try:
-            cur.execute("INSERT INTO usuarios (nome, cpf, email, contato, senha, tipo_perfil, status, crp, foto, psicologa_id) VALUES (%s,%s,%s,%s,%s,%s,'pendente',%s,%s,%s);", 
-                        (request.form.get('nome'), request.form.get('cpf'), request.form.get('email'), request.form.get('contato'), request.form.get('senha'), perfil, request.form.get('crp'), foto_b64, psi_id))
-            conn.commit()
-            enviar_email_boas_vindas(request.form.get('email'), request.form.get('nome'))
-            return redirect('/')
-        except Exception as e: 
-            conn.rollback()
-            return render_template_string(TEMPLATE_UNICO, titulo="Cadastro", conteudo="<div class='erro'>Erro: CPF/E-mail em uso.</div>", script_popup="")
-        finally: cur.close(); conn.close()
-    
-    campos_extras = ""
-    if perfil == 'paciente':
-        cur.execute("SELECT id, nome FROM usuarios WHERE tipo_perfil = 'psicologa' AND status = 'ativo';")
-        options_psi = "".join([f"<option value='{p[0]}'>Dra. {p[1]}</option>" for p in cur.fetchall()])
-        campos_extras = f'<label>Sua Psicóloga (Opcional)</label><select name="psicologa_id"><option value="">Não tenho</option>{options_psi}</select>'
-    elif perfil == 'psicologa':
-        campos_extras = '<div style="background-color: #F9F4F3; padding: 15px; border-radius: 8px; margin-bottom: 15px;"><h3 style="margin-top:0; color:#3A261D;">Dados Profissionais</h3><label>Registro CRP</label><input type="text" name="crp" placeholder="Ex: 00/00000" required><label>Foto de Perfil</label><input type="file" name="foto" accept="image/*"></div>'
-    cur.close(); conn.close()
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="alert alert-{{ cat }} alert-dismissible fade show shadow-sm" role="alert">
+            {{ msg }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
 
-    html = f"""
-    <div class="card" style="max-width: 500px; margin: 0 auto;">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h2 style="margin:0; border:none;">Cadastro - {perfil.capitalize()}</h2>
-            <a href="/login/{perfil}" style="color:#5c3e30; text-decoration:none; font-family:Arial; font-size:0.9rem;">Voltar</a>
-        </div>
-        <hr style="border: 0; height: 1px; background-color: #E8D5D0; margin: 15px 0;">
-        <form method="POST" enctype="multipart/form-data">
-            <label>Nome Completo</label><input type="text" name="nome" required>
-            <label>CPF</label><input type="text" name="cpf" required>
-            <label>E-mail</label><input type="email" name="email" required>
-            <label>Contato (WhatsApp)</label><input type="text" name="contato" required>
-            <label>Crie uma Senha</label><input type="password" name="senha" required>
-            {campos_extras}
-            <button type="submit" class="btn" style="margin-top: 10px;">Solicitar Aprovação</button>
-        </form>
-    </div>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo=f"Cadastro", conteudo=html, script_popup="")
+    <!-- MENU DE NAVEGAÇÃO POR ABAS -->
+    <ul class="nav nav-pills gap-2 mb-4">
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'eventos' %}active{% endif %}" href="{{ url_for('dashboard', tab='eventos') }}">
+                <i class="fa-solid fa-tower-broadcast me-1"></i> Eventos & Chamada TS3
+            </a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'drops' %}active{% endif %}" href="{{ url_for('dashboard', tab='drops') }}">
+                <i class="fa-solid fa-gem me-1"></i> Módulo de Drops (Itens)
+            </a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'players' %}active{% endif %}" href="{{ url_for('dashboard', tab='players') }}">
+                <i class="fa-solid fa-users me-1"></i> Players & Ranking
+            </a>
+        </li>
+        {% if session['role'] == 'admin' %}
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'tsconfig' %}active{% endif %}" href="{{ url_for('dashboard', tab='tsconfig') }}">
+                <i class="fa-solid fa-gears me-1"></i> Configurar TeamSpeak 3
+            </a>
+        </li>
+        {% endif %}
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'perfil' %}active{% endif %}" href="{{ url_for('dashboard', tab='perfil') }}">
+                <i class="fa-solid fa-id-card me-1"></i> Meu Perfil
+            </a>
+        </li>
+    </ul>
 
-# ==========================================
-# MÓDULO DE VÍDEO (JITSI MEET)
-# ==========================================
-@app.route('/sessao_video/<int:sessao_id>', methods=['GET', 'POST'])
-def sala_video(sessao_id):
-    uid = request.args.get('uid')
-    perfil = request.args.get('perfil')
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    if request.method == 'POST' and request.form.get('acao') == 'finalizar':
-        cur.execute("UPDATE agenda SET status_sessao = 'Atendimento realizado' WHERE id = %s;", (sessao_id,))
-        conn.commit()
-        cur.close(); conn.close()
-        return redirect(url_for(f"area_{perfil}", user_id=uid))
+    <!-- ==========================================
+         ABA 1: EVENTOS & CHAMADA NO TS3
+         ========================================== -->
+    {% if tab == 'eventos' %}
+    <div class="row g-4">
+        <!-- Coluna lateral: Lista de Eventos e Criar Evento -->
+        <div class="col-lg-4">
+            {% if session['role'] == 'admin' %}
+            <div class="card p-3 mb-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-plus-circle text-primary me-1"></i> Iniciar Novo Evento</h6>
+                <form method="POST" action="{{ url_for('create_event') }}">
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Nome do Evento / Boss</label>
+                        <input type="text" name="title" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Castle Siege 21h / Boss Raid" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary mb-1">Tipo</label>
+                        <select name="event_type" class="form-select form-select-sm bg-dark text-light border-secondary">
+                            <option value="Guerra / PvP">Guerra / PvP</option>
+                            <option value="Boss / Raid">Boss / Raid</option>
+                            <option value="Evento Diário">Evento Diário</option>
+                            <option value="Reunião TS3">Reunião TS3</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-sm w-100 fw-semibold">
+                        <i class="fa-solid fa-play me-1"></i> Criar Evento
+                    </button>
+                </form>
+            </div>
+            {% endif %}
 
-    cur.execute("SELECT data_hora, status_sessao, paciente_id, psicologa_id FROM agenda WHERE id = %s;", (sessao_id,))
-    sessao = cur.fetchone()
-    
-    if perfil == 'paciente' and sessao[1] == 'Agendado':
-        cur.execute("UPDATE agenda SET status_sessao = 'Aguardando atendimento' WHERE id = %s;", (sessao_id,))
-        conn.commit()
-        status_atual = 'Aguardando atendimento'
-    else:
-        status_atual = sessao[1]
-
-    cur.close(); conn.close()
-    
-    btn_acao = ""
-    texto_teste = ""
-    aviso_jitsi = ""
-
-    if perfil == 'psicologa':
-        btn_acao = '<input type="hidden" name="acao" value="finalizar"><button type="submit" class="btn" style="background-color: #990000; color: white; border: none;">Encerrar e Marcar como Atendimento Realizado</button>'
-        aviso_jitsi = "<p style='color: #990000; font-size: 0.85rem; font-family: Arial; margin-bottom: 15px;'><b>Aviso de Segurança:</b> Como você é a profissional, o servidor pedirá para você clicar em <i>'Eu sou o anfitrião'</i> e logar com seu Google para abrir a porta para o paciente.</p>"
-    elif perfil == 'admin':
-        btn_acao = f'<a href="/admin" class="btn btn-outline" style="width: 100%;">Sair do Modo de Teste (Admin)</a>'
-        texto_teste = " - MODO TESTE (ADMIN)"
-        aviso_jitsi = "<p style='color: #990000; font-size: 0.85rem; font-family: Arial; margin-bottom: 15px;'><b>Aviso de Teste:</b> Clique em <i>'Eu sou o anfitrião'</i> e logue no Google para destrancar a sala, permitindo que a aba do paciente consiga entrar sem pedir senha.</p>"
-    else:
-        btn_acao = f'<a href="/paciente/{uid}" class="btn btn-outline" style="width: 100%;">Sair da Sala de Espera</a>'
-
-    html = f"""
-    <div class="card" style="max-width: 1000px; margin: 0 auto; text-align: center;">
-        <h2 style="margin-bottom: 5px; color: {'#990000' if perfil == 'admin' else '#3A261D'};">Sessão por Vídeo{texto_teste}</h2>
-        <p style="margin-bottom: 10px; font-family: Arial;">Status da Sessão: <strong style="color: #4CAF50;">{status_atual}</strong></p>
-        
-        {aviso_jitsi}
-        
-        <div id="meet" style="width: 100%; height: 500px; background-color: #111; border-radius: 8px; overflow: hidden; margin-bottom: 20px; border: 2px solid #E8D5D0;"></div>
-        
-        <form method="POST">
-            {btn_acao}
-        </form>
-    </div>
-    
-    <script src="https://meet.jit.si/external_api.js"></script>
-    <script>
-        const domain = 'meet.jit.si';
-        const options = {{
-            roomName: 'Clinica_SerPerene_Sessao_{sessao_id}',
-            width: '100%',
-            height: '100%',
-            parentNode: document.querySelector('#meet'),
-            configOverwrite: {{ 
-                prejoinPageEnabled: false, 
-                startWithAudioMuted: false,
-                startWithVideoMuted: false
-            }},
-            interfaceConfigOverwrite: {{ 
-                TOOLBAR_BUTTONS: ['microphone', 'camera', 'chat', 'hangup', 'fullscreen', 'tileview'],
-                SHOW_JITSI_WATERMARK: false,
-                SHOW_PROMOTIONAL_CLOSE_PAGE: false
-            }}
-        }};
-        const api = new JitsiMeetExternalAPI(domain, options);
-    </script>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo="Sala de Sessão", conteudo=html, script_popup="")
-
-# ==========================================
-# PAINÉIS DOS USUÁRIOS
-# ==========================================
-@app.route('/paciente/<int:user_id>', methods=['GET', 'POST'])
-def area_paciente(user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    if request.method == 'POST':
-        acao = request.form.get('acao')
-        if acao == 'diario':
-            cur.execute("INSERT INTO diario_emocional (paciente_id, humor, nota_texto) VALUES (%s, %s, %s);", (user_id, request.form.get('humor'), request.form.get('nota')))
-        elif acao == 'mensagem':
-            cur.execute("INSERT INTO mensagens (remetente_id, destinatario_id, conteudo) VALUES (%s, %s, %s);", (user_id, request.form.get('psi_id'), request.form.get('msg')))
-        conn.commit()
-
-    cur.execute("SELECT id, mensagem FROM notificacoes_popup WHERE usuario_id = %s AND lida = FALSE LIMIT 1;", (user_id,))
-    alerta = cur.fetchone()
-    script_popup = f"<script>window.onload = function() {{ alert('AVISO:\\n\\n{alerta[1]}'); }};</script>" if alerta else ""
-    if alerta: cur.execute("UPDATE notificacoes_popup SET lida = TRUE WHERE id = %s;", (alerta[0],)); conn.commit()
-    
-    cur.execute("SELECT id, data_hora, status_sessao FROM agenda WHERE paciente_id = %s AND status_sessao != 'Atendimento realizado' ORDER BY data_hora ASC LIMIT 1;", (user_id,))
-    prox_sessao = cur.fetchone()
-    
-    cur.execute("SELECT plano, exercicios FROM planos_de_acao WHERE paciente_id = %s ORDER BY data_criacao DESC LIMIT 1;", (user_id,))
-    plano = cur.fetchone()
-    cur.close(); conn.close()
-    
-    html_sessao = ""
-    if prox_sessao:
-        html_sessao = f"""
-        <div class="card" style="border-left: 6px solid #4CAF50; background-color: #f6fff6;">
-            <h2 style="color: #4CAF50;">Vídeo Chamada - Próxima Sessão</h2>
-            <p><strong>Data/Hora:</strong> {prox_sessao[1].strftime('%d/%m/%Y às %H:%M')}</p>
-            <p><strong>Status:</strong> {prox_sessao[2]}</p>
-            <a href="/sessao_video/{prox_sessao[0]}?uid={user_id}&perfil=paciente" class="btn" style="background-color: #4CAF50; color: white; margin-top: 10px;">Entrar na Sala de Vídeo</a>
-        </div>
-        """
-    
-    html_plano = f"<p><strong>Plano:</strong> {plano[0]}</p><p><strong>Tarefas:</strong> {plano[1]}</p>" if plano else "<p>Nenhum plano ativo.</p>"
-    html = f"""
-    {html_sessao}
-    <div class="card"><h2>Minha Jornada</h2>{html_plano}</div>
-    <div class="card">
-        <h2>Diário Emocional</h2>
-        <form method="POST"><input type="hidden" name="acao" value="diario">
-        <label>Humor de hoje:</label><select name="humor"><option>Bem</option><option>Ansioso(a)</option><option>Triste</option><option>Irritado(a)</option></select>
-        <label>Detalhes:</label><textarea name="nota"></textarea><button type="submit" class="btn">Registrar</button></form>
-    </div>
-    <a href="/" class="btn btn-outline" style="margin-bottom:30px;">Sair</a>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo="Paciente", conteudo=html, script_popup=script_popup)
-
-@app.route('/psicologa/<int:user_id>', methods=['GET', 'POST'])
-def area_psicologa(user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    msg_sucesso = ""
-
-    if request.method == 'POST':
-        acao = request.form.get('acao')
-        if acao == 'nova_sessao':
-            cur.execute("INSERT INTO agenda (psicologa_id, paciente_id, data_hora, status_sessao) VALUES (%s, %s, %s, 'Agendado');", 
-                        (user_id, request.form.get('paciente_id'), request.form.get('data_hora')))
-            msg_sucesso = "Sessão agendada com sucesso!"
-        elif acao == 'novo_plano':
-            cur.execute("INSERT INTO planos_de_acao (paciente_id, psicologa_id, plano, exercicios) VALUES (%s, %s, %s, %s);", 
-                        (request.form.get('paciente_id'), user_id, request.form.get('plano'), request.form.get('exercicios')))
-            cur.execute("INSERT INTO notificacoes_popup (usuario_id, mensagem) VALUES (%s, 'Sua psicóloga atualizou seu Plano de Ação e Tarefas!');", (request.form.get('paciente_id'),))
-            msg_sucesso = "Plano criado e paciente notificado!"
-        conn.commit()
-
-    cur.execute("SELECT id, nome FROM usuarios WHERE tipo_perfil = 'paciente' AND status = 'ativo';")
-    opts = "".join([f"<option value='{p[0]}'>{p[1]}</option>" for p in cur.fetchall()])
-    
-    cur.execute("""
-        SELECT a.id, u.nome, a.data_hora, a.status_sessao 
-        FROM agenda a JOIN usuarios u ON a.paciente_id = u.id 
-        WHERE a.psicologa_id = %s AND a.status_sessao != 'Atendimento realizado' 
-        ORDER BY a.data_hora ASC
-    """, (user_id,))
-    sessoes = cur.fetchall()
-    html_sessoes = "".join([
-        f"<div class='mensagem-box'><div><p style='margin:0;'><strong>{s[1]}</strong><br><span style='font-size: 0.8rem;'>{s[2].strftime('%d/%m/%Y %H:%M')} | Status: {s[3]}</span></p></div>"
-        f"<a href='/sessao_video/{s[0]}?uid={user_id}&perfil=psicologa' class='btn btn-small'>Abrir Vídeo</a></div>" 
-        for s in sessoes
-    ]) or "<p>Nenhuma sessão pendente.</p>"
-
-    cur.close(); conn.close()
-    
-    html = f"""
-    {"<div class='sucesso'>"+msg_sucesso+"</div>" if msg_sucesso else ""}
-    
-    <div class="card">
-        <h2>Agendar Nova Sessão (Vídeo)</h2>
-        <form method="POST"><input type="hidden" name="acao" value="nova_sessao">
-            <select name="paciente_id" required><option value="">Paciente...</option>{opts}</select>
-            <input type="datetime-local" name="data_hora" required>
-            <button type="submit" class="btn">Confirmar Agendamento</button>
-        </form>
-    </div>
-
-    <div class="card" style="border-left: 6px solid #4CAF50;">
-        <h2 style="color: #4CAF50;">Salas de Atendimento (Agenda)</h2>
-        {html_sessoes}
-    </div>
-
-    <div class="card">
-        <h2>Atualizar Plano e Tarefas</h2>
-        <form method="POST"><input type="hidden" name="acao" value="novo_plano">
-            <select name="paciente_id" required><option value="">Paciente...</option>{opts}</select>
-            <textarea name="plano" placeholder="Plano principal" required></textarea>
-            <textarea name="exercicios" placeholder="Tarefas (opcional)"></textarea>
-            <button type="submit" class="btn">Salvar e Disparar Alerta</button>
-        </form>
-    </div>
-    <a href="/" class="btn btn-outline" style="margin-bottom:30px;">Sair</a>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo="Psicóloga", conteudo=html, script_popup="")
-
-@app.route('/admin', methods=['GET', 'POST'])
-def area_admin():
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    msg_admin = ""
-    if request.method == 'POST':
-        acao = request.form.get('acao')
-        if acao == 'campanha':
-            cur.execute("INSERT INTO recados_gerais (autor_id, tipo, mensagem) VALUES ((SELECT id FROM usuarios WHERE tipo_perfil='admin' LIMIT 1), 'Campanha', %s);", (request.form.get('mensagem'),))
-            conn.commit()
-            msg_admin = "Campanha publicada com sucesso!"
-        elif acao == 'novo_usuario':
-            try:
-                cur.execute("""
-                    INSERT INTO usuarios (nome, cpf, email, contato, senha, tipo_perfil, status) 
-                    VALUES (%s, %s, %s, %s, %s, %s, 'ativo');
-                """, (
-                    request.form.get('nome'), request.form.get('cpf'), request.form.get('email'),
-                    request.form.get('contato'), request.form.get('senha'), request.form.get('tipo_perfil')
-                ))
-                conn.commit()
-                msg_admin = f"Usuário ({request.form.get('tipo_perfil')}) criado e ativado com sucesso!"
-            except Exception as e:
-                conn.rollback()
-                msg_admin = "Erro ao criar: CPF ou E-mail já estão em uso no sistema."
-
-    cur.execute("SELECT id, nome, email, contato, tipo_perfil, crp FROM usuarios WHERE status = 'pendente';")
-    pendentes = cur.fetchall()
-    html_pendentes = "".join([f"<div style='border-bottom: 1px solid #E8D5D0; padding: 15px 0; display: flex; justify-content: space-between; align-items: center;'><div><strong>{p[1]}</strong><br><span style='font-size: 0.85rem; font-family: Arial; color: #5c3e30; font-weight: bold;'>Solicitou acesso como: {p[4].capitalize()}</span><br><span style='font-size: 0.8rem; font-family: Arial;'>{p[2]} | {p[3]}</span></div><a href='/aprovar/{p[0]}' class='btn btn-small'>Aprovar Cadastro</a></div>" for p in pendentes]) or "<p>Nenhum cadastro aguardando.</p>"
-
-    cur.execute("""
-        SELECT a.id, pac.nome, psi.nome, a.data_hora, a.status_sessao 
-        FROM agenda a 
-        JOIN usuarios pac ON a.paciente_id = pac.id 
-        JOIN usuarios psi ON a.psicologa_id = psi.id 
-        ORDER BY a.data_hora ASC LIMIT 10;
-    """)
-    agenda_global = cur.fetchall()
-    html_agenda_global = "".join([
-        f"<div class='mensagem-box' style='display:flex; justify-content:space-between; align-items:center;'>"
-        f"<div><p style='margin:0;'><strong>{ag[1]} (Pac.) x Dra. {ag[2]}</strong><br>"
-        f"<span style='font-size: 0.8rem;'>{ag[3].strftime('%d/%m/%Y %H:%M') if ag[3] else 'S/D'} | Status: {ag[4]}</span></p></div>"
-        f"<a href='/sessao_video/{ag[0]}?uid=1&perfil=admin' class='btn btn-small' style='background-color:#4CAF50;'>Entrar no Vídeo (Teste)</a>"
-        f"</div>" for ag in agenda_global
-    ]) or "<p>Nenhuma sessão registrada na clínica.</p>"
-
-    cur.close(); conn.close()
-    
-    html_msg = f"<div class='sucesso'>{msg_admin}</div>" if msg_admin and "Erro" not in msg_admin else (f"<div class='erro'>{msg_admin}</div>" if msg_admin else "")
-
-    html = f"""
-    <div class="alerta">Painel Administrativo Mestre</div>
-    {html_msg}
-
-    <div class="card" style="background-color: #fcf9f8;">
-        <h2>Adicionar Novo Usuário (Acesso Direto)</h2>
-        <p style="font-family:Arial; font-size:0.9rem; color:#5c3e30; margin-bottom: 15px;">Crie administradores, psicólogas ou pacientes. Eles já entram com status ATIVO.</p>
-        <form method="POST">
-            <input type="hidden" name="acao" value="novo_usuario">
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <div style="flex: 1; min-width: 150px;">
-                    <label>Perfil</label>
-                    <select name="tipo_perfil" required>
-                        <option value="admin">Administrador</option>
-                        <option value="psicologa">Psicóloga</option>
-                        <option value="paciente">Paciente</option>
-                    </select>
-                </div>
-                <div style="flex: 2; min-width: 200px;">
-                    <label>Nome Completo</label><input type="text" name="nome" required>
+            <div class="card p-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-calendar-check text-info me-1"></i> Histórico de Eventos ({{ total_events }})</h6>
+                <div class="list-group list-group-flush">
+                    {% for ev in events %}
+                    <a href="{{ url_for('dashboard', tab='eventos', event_id=ev.id) }}"
+                       class="list-group-item list-group-item-action bg-transparent text-light border-secondary py-2 {% if selected_event and selected_event.id == ev.id %}active rounded{% endif %}">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <strong class="small">{{ ev.title }}</strong>
+                            <span class="badge bg-dark border border-secondary">{{ ev.event_type }}</span>
+                        </div>
+                        <div class="small text-secondary mt-1" style="font-size: 0.75rem;">
+                            <i class="fa-regular fa-clock me-1"></i> {{ ev.created_at }}
+                        </div>
+                    </a>
+                    {% else %}
+                    <p class="text-secondary small mb-0">Nenhum evento registrado ainda.</p>
+                    {% endfor %}
                 </div>
             </div>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <div style="flex: 1; min-width: 150px;"><label>CPF</label><input type="text" name="cpf" required></div>
-                <div style="flex: 1; min-width: 200px;"><label>E-mail</label><input type="email" name="email" required></div>
+        </div>
+
+        <!-- Coluna Principal: Painel de Chamada do Evento Selecionado -->
+        <div class="col-lg-8">
+            {% if selected_event %}
+            <div class="card p-4">
+                <div class="d-flex flex-wrap justify-content-between align-items-center border-bottom border-secondary pb-3 mb-3 gap-2">
+                    <div>
+                        <span class="badge bg-primary mb-1">{{ selected_event.event_type }}</span>
+                        <h4 class="fw-bold mb-0">{{ selected_event.title }}</h4>
+                        <small class="text-secondary">
+                            Criado em {{ selected_event.created_at }} | Última leitura TS3: <strong>{{ selected_event.last_sync }}</strong>
+                        </small>
+                    </div>
+
+                    {% if session['role'] == 'admin' %}
+                    <div class="d-flex gap-2">
+                        <form method="POST" action="{{ url_for('sync_event_ts3', event_id=selected_event.id) }}">
+                            <button type="submit" class="btn btn-success fw-semibold">
+                                <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Presença do TS3 Agora
+                            </button>
+                        </form>
+                        <form method="POST" action="{{ url_for('delete_event', event_id=selected_event.id) }}" onsubmit="return confirm('Excluir este evento e todas as presenças dele?');">
+                            <button type="submit" class="btn btn-outline-danger">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                        </form>
+                    </div>
+                    {% endif %}
+                </div>
+
+                {% if session['role'] == 'admin' %}
+                <div class="mb-3">
+                    <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#collapsePaste">
+                        <i class="fa-solid fa-paste me-1"></i> Contingência: Colar lista de Nicks do TS3 manualmente
+                    </button>
+                    <div class="collapse mt-2" id="collapsePaste">
+                        <form method="POST" action="{{ url_for('manual_paste_ts3', event_id=selected_event.id) }}" class="card card-body bg-dark border-secondary p-2">
+                            <small class="text-secondary mb-1">Se o host do seu TS3 estiver bloqueando conexão externa, cole aqui os nicks copiados da sala (um por linha ou separados por vírgula):</small>
+                            <textarea name="raw_nicks" rows="2" class="form-control form-control-sm bg-black text-light border-secondary mb-2" placeholder="Ex:&#10;[CLAN] Player1&#10;Player2"></textarea>
+                            <button type="submit" class="btn btn-sm btn-info align-self-end">Processar Nicks Colados</button>
+                        </form>
+                    </div>
+                </div>
+                {% endif %}
+
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
+                        <thead>
+                            <tr>
+                                <th>Login Player</th>
+                                <th>Nick Cadastrado (TS3)</th>
+                                <th>Status no Evento</th>
+                                <th>Nick Lido / Método</th>
+                                {% if session['role'] == 'admin' %}
+                                <th class="text-end">Ação Manual</th>
+                                {% endif %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for u in users %}
+                            {% set att = event_attendance.get(u.id) %}
+                            <tr>
+                                <td class="fw-semibold">{{ u.username }}</td>
+                                <td><span class="badge bg-secondary">{{ u.ts_nick }}</span></td>
+                                <td>
+                                    {% if att %}
+                                        <span class="badge bg-success"><i class="fa-solid fa-check me-1"></i> PRESENTE</span>
+                                    {% else %}
+                                        <span class="badge bg-danger bg-opacity-50 text-light"><i class="fa-solid fa-xmark me-1"></i> AUSENTE</span>
+                                    {% endif %}
+                                </td>
+                                <td class="small text-secondary">
+                                    {% if att %}
+                                        <strong class="text-light">{{ att.ts_nick_found }}</strong> ({{ att.method }} às {{ att.checked_at }})
+                                    {% else %}
+                                        —
+                                    {% endif %}
+                                </td>
+                                {% if session['role'] == 'admin' %}
+                                <td class="text-end">
+                                    <form method="POST" action="{{ url_for('toggle_attendance', event_id=selected_event.id, user_id=u.id) }}" class="d-inline">
+                                        {% if att %}
+                                            <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Remover presença">
+                                                Remover
+                                            </button>
+                                        {% else %}
+                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Marcar presença manual">
+                                                + Presença
+                                            </button>
+                                        {% endif %}
+                                    </form>
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <div style="flex: 1; min-width: 150px;"><label>Contato</label><input type="text" name="contato" required></div>
-                <div style="flex: 1; min-width: 150px;"><label>Senha</label><input type="password" name="senha" required></div>
+            {% else %}
+            <div class="card p-5 text-center">
+                <i class="fa-solid fa-tower-broadcast fa-3x text-secondary mb-3"></i>
+                <h5>Nenhum Evento Selecionado</h5>
+                <p class="text-secondary small">Crie um evento ao lado para puxar a lista de presença do TeamSpeak 3.</p>
             </div>
-            <button type="submit" class="btn" style="width: 100%; margin-top: 10px;">Criar Usuário</button>
-        </form>
+            {% endif %}
+        </div>
     </div>
+    {% endif %}
 
-    <div class="card">
-        <h2>Aprovações Pendentes</h2>
-        <p style="font-family:Arial; font-size:0.9rem; color:#5c3e30;">Libere o acesso dos pacientes e psicólogas que se cadastraram externamente.</p>
-        {html_pendentes}
+    <!-- ==========================================
+         ABA 2: MÓDULO DE DROPS (ITENS)
+         ========================================== -->
+    {% if tab == 'drops' %}
+    <div class="row g-4">
+        {% if session['role'] == 'admin' %}
+        <div class="col-lg-4">
+            <div class="card p-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-box-open text-warning me-1"></i> Cadastrar Novo Drop / Item</h6>
+                <form method="POST" action="{{ url_for('create_drop') }}">
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Nome do Item (Drop)</label>
+                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Espada Lendária +15 / Joia Boss" required>
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-7">
+                            <label class="form-label small text-secondary mb-1">Raridade</label>
+                            <select name="rarity" class="form-select form-select-sm bg-dark text-light border-secondary">
+                                <option value="Comum">Comum</option>
+                                <option value="Raro" selected>Raro</option>
+                                <option value="Épico">Épico</option>
+                                <option value="Lendário">Lendário</option>
+                            </select>
+                        </div>
+                        <div class="col-5">
+                            <label class="form-label small text-secondary mb-1">Qtd</label>
+                            <input type="number" name="quantity" value="1" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Boss / Origem</label>
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Kundun / Dragão Vermelho">
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Vincular a um Evento (Opcional)</label>
+                        <select name="event_id" class="form-select form-select-sm bg-dark text-light border-secondary">
+                            <option value="">-- Sem vínculo --</option>
+                            {% for ev in events %}
+                            <option value="{{ ev.id }}">{{ ev.title }} ({{ ev.created_at }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Destinado ao Player (Opcional)</label>
+                        <select name="winner_user_id" class="form-select form-select-sm bg-dark text-light border-secondary">
+                            <option value="">-- No Banco do Clã (Sem dono) --</option>
+                            {% for u in users %}
+                            <option value="{{ u.id }}">{{ u.username }} (TS3: {{ u.ts_nick }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary mb-1">Status do Item</label>
+                        <select name="status" class="form-select form-select-sm bg-dark text-light border-secondary">
+                            <option value="Banco do Clã">No Banco do Clã</option>
+                            <option value="Em Sorteio / Leilão">Em Sorteio / Leilão</option>
+                            <option value="Entregue ao Player">Entregue ao Player</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">
+                        <i class="fa-solid fa-plus me-1"></i> Adicionar Drop
+                    </button>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
+            <div class="card p-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-gem text-info me-1"></i> Registro Geral de Drops do Clã ({{ drops|length }})</h6>
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
+                        <thead>
+                            <tr>
+                                <th>Item / Drop</th>
+                                <th>Boss / Evento</th>
+                                <th>Status</th>
+                                <th>Player Recebedor</th>
+                                {% if session['role'] == 'admin' %}
+                                <th class="text-end">Gerenciar</th>
+                                {% endif %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for d in drops %}
+                            <tr>
+                                <td>
+                                    <span class="badge badge-raridade-{{ d.rarity }} me-1">{{ d.rarity }}</span>
+                                    <strong>{{ d.item_name }}</strong>
+                                    <span class="badge bg-secondary ms-1">x{{ d.quantity }}</span>
+                                    <div class="text-secondary" style="font-size: 0.72rem;">{{ d.created_at }}</div>
+                                </td>
+                                <td class="small">
+                                    <div>{{ d.boss_source or '—' }}</div>
+                                    {% if d.event_title %}
+                                        <span class="badge bg-dark border border-secondary">{{ d.event_title }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span class="badge {% if d.status == 'Entregue ao Player' %}bg-success{% elif d.status == 'Banco do Clã' %}bg-info text-dark{% else %}bg-warning text-dark{% endif %}">
+                                        {{ d.status }}
+                                    </span>
+                                </td>
+                                <td>
+                                    {% if d.winner_name %}
+                                        <strong class="text-warning"><i class="fa-solid fa-crown me-1"></i>{{ d.winner_name }}</strong>
+                                        <small class="text-secondary">({{ d.winner_nick }})</small>
+                                    {% else %}
+                                        <span class="text-secondary small">Estoque Clã</span>
+                                    {% endif %}
+                                </td>
+                                {% if session['role'] == 'admin' %}
+                                <td class="text-end">
+                                    <div class="d-flex justify-content-end gap-1">
+                                        <form method="POST" action="{{ url_for('assign_drop', drop_id=d.id) }}" class="d-flex gap-1">
+                                            <select name="winner_user_id" class="form-select form-select-sm bg-dark text-light border-secondary py-0" style="width: 130px; font-size:0.75rem;">
+                                                <option value="">-- Clã --</option>
+                                                {% for u in users %}
+                                                <option value="{{ u.id }}" {% if d.winner_user_id == u.id %}selected{% endif %}>{{ u.username }}</option>
+                                                {% endfor %}
+                                            </select>
+                                            <input type="hidden" name="status" value="Entregue ao Player">
+                                            <button type="submit" class="btn btn-sm btn-outline-info py-0 px-2" title="Atribuir a este Player">
+                                                <i class="fa-solid fa-check"></i>
+                                            </button>
+                                        </form>
+                                        <form method="POST" action="{{ url_for('delete_drop', drop_id=d.id) }}" onsubmit="return confirm('Excluir este drop?');">
+                                            <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
+                                                <i class="fa-solid fa-trash"></i>
+                                            </button>
+                                        </form>
+                                    </div>
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% else %}
+                            <tr>
+                                <td colspan="5" class="text-center text-secondary py-4">Nenhum drop cadastrado ainda.</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
     </div>
+    {% endif %}
 
-    <div class="card" style="border-left: 6px solid #4CAF50;">
-        <h2 style="color: #4CAF50;">Agenda Global e Teste de Vídeo</h2>
-        <p style="font-family:Arial; font-size:0.9rem; margin-bottom: 15px;">Acompanhe as sessões e entre nas salas em modo de observação para testes.</p>
-        {html_agenda_global}
+    <!-- ==========================================
+         ABA 3: JOGADORES (CRIAR / EXCLUIR / RANKING)
+         ========================================== -->
+    {% if tab == 'players' %}
+    <div class="row g-4">
+        {% if session['role'] == 'admin' %}
+        <div class="col-lg-4">
+            <div class="card p-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-success me-1"></i> Cadastrar Novo Player / Admin</h6>
+                <form method="POST" action="{{ url_for('create_user') }}">
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Login de Acesso ao Site</label>
+                        <input type="text" name="username" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: jefferson" required>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Senha do Player</label>
+                        <input type="text" name="password" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Senha inicial" required>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Nick Exato no TeamSpeak 3</label>
+                        <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Jefferson (sem precisar da tag)" required>
+                        <div class="form-text text-secondary" style="font-size: 0.72rem;">
+                            O sistema reconhece mesmo se ele usar tag antes do nome no TS3 (ex: <code>[CLAN] Jefferson</code>).
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary mb-1">Permissão no Site</label>
+                        <select name="role" class="form-select form-select-sm bg-dark text-light border-secondary">
+                            <option value="player" selected>Player (Visualiza Presenças e Drops)</option>
+                            <option value="admin">Administrador (Controle Total)</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-success btn-sm w-100 fw-semibold">
+                        <i class="fa-solid fa-check me-1"></i> Criar Conta do Player
+                    </button>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
+            <div class="card p-3">
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-trophy text-warning me-1"></i> Membros Cadastrados & Taxa de Presença TS3</h6>
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
+                        <thead>
+                            <tr>
+                                <th>Login Site</th>
+                                <th>Nick no TS3</th>
+                                <th>Cargo</th>
+                                <th>Presenças ({{ total_events }} Eventos)</th>
+                                <th>Drops Recebidos</th>
+                                {% if session['role'] == 'admin' %}
+                                <th class="text-end">Excluir</th>
+                                {% endif %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for u in users %}
+                            <tr>
+                                <td class="fw-bold">{{ u.username }}</td>
+                                <td><span class="badge bg-secondary">{{ u.ts_nick }}</span></td>
+                                <td>
+                                    {% if u.role == 'admin' %}
+                                        <span class="badge bg-primary">Admin</span>
+                                    {% else %}
+                                        <span class="badge bg-dark border border-secondary">Player</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <div class="progress flex-grow-1 bg-dark" style="height: 8px; max-width: 110px;">
+                                            <div class="progress-bar bg-success" style="width: {{ u.pct }}%;"></div>
+                                        </div>
+                                        <span class="small fw-semibold">{{ u.presences }} ({{ u.pct }}%)</span>
+                                    </div>
+                                </td>
+                                <td>
+                                    <span class="badge bg-warning text-dark fw-bold">{{ u.drops_won }} itens</span>
+                                </td>
+                                {% if session['role'] == 'admin' %}
+                                <td class="text-end">
+                                    {% if u.id != session['user_id'] %}
+                                    <form method="POST" action="{{ url_for('delete_user', user_id=u.id) }}" onsubmit="return confirm('Excluir o jogador {{ u.username }}?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
+                                            <i class="fa-solid fa-user-xmark"></i>
+                                        </button>
+                                    </form>
+                                    {% endif %}
+                                </td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
     </div>
+    {% endif %}
 
-    <div class="card">
-        <h2>Atalhos de Gestão e Comunicação</h2>
-        <form method="POST" style="margin-bottom: 20px;"><input type="hidden" name="acao" value="campanha">
-            <label>Disparar mensagem/campanha para toda a clínica:</label>
-            <textarea name="mensagem" required></textarea>
-            <button type="submit" class="btn">Publicar Campanha Geral</button>
-        </form>
+    <!-- ==========================================
+         ABA 4: CONFIGURAÇÃO DO TEAMSPEAK 3 (ADMIN)
+         ========================================== -->
+    {% if tab == 'tsconfig' and session['role'] == 'admin' %}
+    <div class="row justify-content-center">
+        <div class="col-lg-7">
+            <div class="card p-4">
+                <h5 class="fw-bold mb-1"><i class="fa-solid fa-server text-primary me-2"></i> Credenciais do Servidor TeamSpeak 3 (ServerQuery)</h5>
+                <p class="text-secondary small mb-4">
+                    Preencha os dados do seu servidor TS3 para que o sistema conecte na porta Query e puxe os nicks presentes nas salas em tempo real.
+                </p>
+
+                <form method="POST" action="{{ url_for('save_tsconfig') }}">
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label small text-secondary">Endereço IP ou Domínio do TS3</label>
+                            <input type="text" name="host" value="{{ ts_cfg.host }}" class="form-control bg-dark text-light border-secondary" placeholder="Ex: 191.252.100.10 ou meuclan.ts3.com.br" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-secondary">Porta de Voz (UDP)</label>
+                            <input type="number" name="voice_port" value="{{ ts_cfg.voice_port }}" class="form-control bg-dark text-light border-secondary" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-secondary">Porta ServerQuery (TCP)</label>
+                            <input type="number" name="query_port" value="{{ ts_cfg.query_port }}" class="form-control bg-dark text-light border-secondary" required>
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label small text-secondary">Usuário ServerQuery</label>
+                            <input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary" placeholder="Ex: serveradmin">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small text-secondary">Senha ServerQuery</label>
+                            <input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary" placeholder="Senha gerada no TS3">
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label small text-secondary">Ignorar Salas com estes Nomes (separados por vírgula)</label>
+                        <input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary" placeholder="Ex: AFK, Ausente, Away">
+                        <div class="form-text text-secondary small">
+                            Quem estiver em uma sala que contenha qualquer uma dessas palavras não ganhará presença automática.
+                        </div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" name="action" value="save" class="btn btn-primary fw-semibold">
+                            <i class="fa-solid fa-floppy-disk me-1"></i> Salvar Configurações
+                        </button>
+                        <button type="submit" name="action" value="test" class="btn btn-outline-info fw-semibold">
+                            <i class="fa-solid fa-plug-circle-check me-1"></i> Salvar e Testar Conexão Agora
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
     </div>
+    {% endif %}
 
-    <a href="/" class="btn btn-outline" style="margin-bottom:30px;">Sair do Painel Admin</a>
-    """
-    return render_template_string(TEMPLATE_UNICO, titulo="Admin", conteudo=html, script_popup="")
+    <!-- ==========================================
+         ABA 5: MEU PERFIL (PLAYER / ADMIN)
+         ========================================== -->
+    {% if tab == 'perfil' %}
+    <div class="row justify-content-center">
+        <div class="col-lg-5">
+            <div class="card p-4">
+                <h5 class="fw-bold mb-3"><i class="fa-solid fa-user-gear text-info me-2"></i> Meus Dados de Jogador</h5>
+                <form method="POST" action="{{ url_for('update_profile') }}">
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Login</label>
+                        <input type="text" value="{{ session['username'] }}" class="form-control bg-dark text-secondary border-secondary" disabled>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Meu Nick no TeamSpeak 3</label>
+                        <input type="text" name="ts_nick" value="{{ session['ts_nick'] }}" class="form-control bg-dark text-light border-secondary" required>
+                    </div>
+                    <div class="mb-4">
+                        <label class="form-label small text-secondary">Nova Senha (deixe em branco para manter a atual)</label>
+                        <input type="password" name="new_password" class="form-control bg-dark text-light border-secondary" placeholder="••••••••">
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100 fw-semibold">
+                        <i class="fa-solid fa-save me-1"></i> Atualizar Meu Perfil
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+    {% endif %}
 
-@app.route('/aprovar/<int:user_id>')
-def aprovar_usuario(user_id):
-    conn = get_db_connection()
-    if conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE usuarios SET status = 'ativo' WHERE id = %s;", (user_id,))
-        conn.commit()
-        cur.close(); conn.close()
-    return redirect(url_for('area_admin'))
+</div>
 
-if __name__ == '__main__':
-    iniciar_banco()
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=True)
