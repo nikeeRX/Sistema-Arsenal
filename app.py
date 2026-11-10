@@ -1,5 +1,5 @@
 import os
-import time
+import tim
 import socket
 import sqlite3
 from urllib.parse import urlparse
@@ -17,7 +17,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ts3_guild_tracker_secret_key_2026")
 
 # ==========================================
-# CAMADA DE BANCO DE DADOS (PG8000 / SQLITE
+# CAMADA DE BANCO DE DADOS (PG8000 / SQLITE)
 # ==========================================
 def get_database_url():
     url = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL")
