@@ -81,6 +81,12 @@ def db_execute(query, params=(), fetch=False, fetchone=False):
         cur.close()
         conn.close()
 
+def safe_add_column(table_name, column_def):
+    try:
+        db_execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
+    except Exception:
+        pass
+
 def init_db():
     id_col = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
@@ -133,19 +139,36 @@ def init_db():
         )
     """)
 
-    # 4. Estoque de Itens (Estilo Estoque de Bar Acumulativo)
+    # 4. Catálogo Consolidado de Itens (Soma de todas as entradas disponíveis para saque)
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS inventory_items (
             id {id_col},
             item_name VARCHAR(150) UNIQUE NOT NULL,
             rarity VARCHAR(50) DEFAULT 'Raro',
+            tkp_value INTEGER DEFAULT 100,
             stock_qty INTEGER DEFAULT 0,
             boss_source VARCHAR(120) DEFAULT '',
             updated_at VARCHAR(40)
         )
     """)
+    # Garante que a coluna tkp_value exista caso a tabela já tenha sido criada na versão anterior
+    safe_add_column("inventory_items", "tkp_value INTEGER DEFAULT 100")
 
-    # 5. Leilões / Disputas de Lances
+    # 5. Histórico de Entradas no Estoque por Data de Chegada
+    db_execute(f"""
+        CREATE TABLE IF NOT EXISTS inventory_entries (
+            id {id_col},
+            item_id INTEGER NOT NULL,
+            item_name VARCHAR(150) NOT NULL,
+            rarity VARCHAR(50) DEFAULT 'Raro',
+            tkp_value INTEGER DEFAULT 100,
+            qty_added INTEGER NOT NULL,
+            boss_source VARCHAR(120) DEFAULT '',
+            arrival_date VARCHAR(40) NOT NULL
+        )
+    """)
+
+    # 6. Leilões / Disputas de Saque em TKP
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS auctions (
             id {id_col},
@@ -167,7 +190,7 @@ def init_db():
         )
     """)
 
-    # 6. Lances dos Players em cada Leilão
+    # 7. Lances dos Players em TKP
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS auction_bids (
             id {id_col},
@@ -179,7 +202,7 @@ def init_db():
         )
     """)
 
-    # 7. Notificações de Vencedores e Desempates
+    # 8. Notificações de Vencedores e Desempates
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS notifications (
             id {id_col},
@@ -189,6 +212,24 @@ def init_db():
             created_at VARCHAR(40)
         )
     """)
+
+    # Backfill: se já existiam itens cadastrados antes desta atualização sem registro de entrada, cria o registro inicial
+    existing_items = db_execute("SELECT * FROM inventory_items", fetch=True)
+    for it in existing_items:
+        has_entry = db_execute("SELECT id FROM inventory_entries WHERE item_id = ?", (it["id"],), fetchone=True)
+        if not has_entry and int(it.get("stock_qty") or 0) > 0:
+            db_execute("""
+                INSERT INTO inventory_entries (item_id, item_name, rarity, tkp_value, qty_added, boss_source, arrival_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                it["id"],
+                it["item_name"],
+                it.get("rarity", "Raro"),
+                int(it.get("tkp_value") or 100),
+                int(it["stock_qty"]),
+                it.get("boss_source", ""),
+                it.get("updated_at") or datetime.now().strftime("%d/%m/%Y %H:%M")
+            ))
 
     cfg = db_execute("SELECT id FROM ts_config WHERE id = 1", fetchone=True)
     if not cfg:
@@ -213,7 +254,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# MOTOR DE APURAÇÃO DE LANCES E DESEMPATE (6 MIN)
+# MOTOR DE APURAÇÃO DE LANCES (TKP) E DESEMPATE (6 MIN)
 # ==========================================
 def create_notification(user_id, message):
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -223,12 +264,6 @@ def create_notification(user_id, message):
     )
 
 def resolve_expired_auctions(force_auction_id=None):
-    """
-    Verifica todos os leilões ativos cujo tempo limite já expirou.
-    - Se houver 1 único maior lance: define vencedor, muda para 'Aguardando Entrega' e envia notificação.
-    - Se houver empate no maior lance: abre rodada de desempate de 6 minutos ('Em Desempate')
-      restrita aos empatantes, iniciando a partir do último valor empatado.
-    """
     now_epoch = int(time.time())
     if force_auction_id:
         active_auctions = db_execute(
@@ -245,7 +280,6 @@ def resolve_expired_auctions(force_auction_id=None):
         aid = auc["id"]
         rnd = int(auc["round_number"] or 1)
 
-        # Busca lances da rodada atual
         bids = db_execute("""
             SELECT b.*, u.username, u.ts_nick
             FROM auction_bids b
@@ -254,10 +288,8 @@ def resolve_expired_auctions(force_auction_id=None):
             ORDER BY b.bid_amount DESC, b.id ASC
         """, (aid, rnd), fetch=True)
 
-        # Caso ninguém tenha dado lance na rodada
         if not bids:
             if auc["status"] == "Em Desempate" and auc["tied_user_ids"]:
-                # Se ninguém aumentou o lance durante os 6 min de desempate, renova mais 6 min para os empatados
                 new_end_epoch = int(time.time()) + 360
                 new_end_str = datetime.fromtimestamp(new_end_epoch).strftime("%d/%m %H:%M:%S")
                 db_execute(
@@ -265,7 +297,7 @@ def resolve_expired_auctions(force_auction_id=None):
                     (new_end_epoch, new_end_str, aid)
                 )
             else:
-                # Nenhum lance na rodada 1: devolve a quantidade ao estoque do bar
+                # Devolve ao saldo disponível para saque se ninguém deu lance
                 db_execute(
                     "UPDATE inventory_items SET stock_qty = stock_qty + ? WHERE id = ?",
                     (auc["qty"], auc["item_id"])
@@ -276,7 +308,6 @@ def resolve_expired_auctions(force_auction_id=None):
                 )
             continue
 
-        # Pega o maior lance de cada jogador na rodada atual
         best_per_user = {}
         for b in bids:
             uid = b["user_id"]
@@ -288,7 +319,6 @@ def resolve_expired_auctions(force_auction_id=None):
         top_bidders = [item for item in best_per_user.values() if item["bid_amount"] == max_bid]
 
         if len(top_bidders) == 1:
-            # VENCEDOR ÚNICO!
             winner = top_bidders[0]
             db_execute("""
                 UPDATE auctions
@@ -301,10 +331,9 @@ def resolve_expired_auctions(force_auction_id=None):
 
             create_notification(
                 winner["user_id"],
-                f"🏆 Parabéns! Você venceu o lance do item '{auc['item_name']} (x{auc['qty']})' com a oferta de {max_bid}! Procure o Admin in-game para receber seu item."
+                f"🏆 Parabéns! Você venceu o saque do item '{auc['item_name']} (x{auc['qty']})' com o lance de {max_bid} TKP! Procure o Admin in-game para receber seu item."
             )
         else:
-            # EMPATE NO MAIOR LANCE -> ABRE NOVO LANCE DE 6 MINUTOS PARA OS EMPATANTES!
             tied_ids_str = ",".join(str(b["user_id"]) for b in top_bidders)
             tied_names = ", ".join(b["username"] for b in top_bidders)
             new_round = rnd + 1
@@ -326,7 +355,7 @@ def resolve_expired_auctions(force_auction_id=None):
             for b in top_bidders:
                 create_notification(
                     b["user_id"],
-                    f"⚡ EMPATE no item '{auc['item_name']}' no valor de {max_bid} (Empatados: {tied_names})! Uma nova rodada exclusiva de 6 minutos foi aberta a partir de {max_bid}."
+                    f"⚡ EMPATE no item '{auc['item_name']}' no valor de {max_bid} TKP (Empatados: {tied_names})! Uma nova rodada exclusiva de 6 minutos foi aberta a partir de {max_bid} TKP."
                 )
 
 # ==========================================
@@ -510,10 +539,9 @@ def read_notifications():
 @app.route("/")
 @login_required
 def dashboard():
-    # Sempre verifica se algum leilão acabou de expirar antes de carregar a tela
     resolve_expired_auctions()
 
-    tab = request.args.get("tab", "drops")
+    tab = request.args.get("tab", "estoque")
     selected_event_id = request.args.get("event_id", type=int)
 
     users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
@@ -536,7 +564,6 @@ def dashboard():
     all_att = db_execute("SELECT user_id, COUNT(*) as cnt FROM attendance GROUP BY user_id", fetch=True)
     att_counts = {r["user_id"]: int(r["cnt"]) for r in all_att}
 
-    # Conta itens ganhos e já entregues (ou aguardando entrega)
     won_rows = db_execute("""
         SELECT winner_user_id, SUM(qty) as cnt
         FROM auctions
@@ -551,10 +578,28 @@ def dashboard():
         u["pct"] = round((presences / total_events) * 100, 1) if total_events > 0 else 0.0
         u["drops_won"] = drop_counts.get(u["id"], 0)
 
-    # Estoque de itens (estilo bar)
-    inventory = db_execute("SELECT * FROM inventory_items ORDER BY stock_qty DESC, item_name ASC", fetch=True)
+    # 1. Catálogo completo de itens (para a lista suspensa e para o consolidado de saque)
+    catalog_items = db_execute("SELECT * FROM inventory_items ORDER BY item_name ASC", fetch=True)
 
-    # Leilões ativos e histórico
+    # 2. Histórico de Entradas no Estoque por Data de Chegada (Aba Estoque)
+    stock_entries = db_execute("SELECT * FROM inventory_entries ORDER BY id DESC", fetch=True)
+
+    # Quantidade de lotes/entradas registradas por item
+    entries_count_map = {}
+    for e in stock_entries:
+        entries_count_map[e["item_id"]] = entries_count_map.get(e["item_id"], 0) + 1
+
+    # 3. Drops Disponíveis para Saque (Soma consolidada de todas as datas de entrada com saldo > 0)
+    available_drops = []
+    for item in catalog_items:
+        item["tkp_value"] = int(item.get("tkp_value") or 0)
+        item["stock_qty"] = int(item.get("stock_qty") or 0)
+        item["total_tkp_worth"] = item["stock_qty"] * item["tkp_value"]
+        item["batches_count"] = entries_count_map.get(item["id"], 0)
+        if item["stock_qty"] > 0:
+            available_drops.append(item)
+
+    # 4. Leilões / Saques ativos e histórico
     auctions = db_execute("""
         SELECT a.*, u.username as winner_name, u.ts_nick as winner_nick
         FROM auctions a
@@ -562,7 +607,6 @@ def dashboard():
         ORDER BY a.id DESC
     """, fetch=True)
 
-    # Mapeia lances de cada leilão para mostrar no card
     all_bids = db_execute("""
         SELECT b.*, u.username, u.ts_nick
         FROM auction_bids b
@@ -589,7 +633,6 @@ def dashboard():
         else:
             a["can_user_bid"] = False
 
-    # Notificações não lidas do usuário logado
     my_notifications = db_execute(
         "SELECT * FROM notifications WHERE user_id = ? AND is_read = 0 ORDER BY id DESC",
         (session["user_id"],), fetch=True
@@ -603,7 +646,9 @@ def dashboard():
         selected_event=selected_event,
         event_attendance=event_attendance,
         ts_cfg=ts_cfg,
-        inventory=inventory,
+        catalog_items=catalog_items,
+        stock_entries=stock_entries,
+        available_drops=available_drops,
         auctions=auctions,
         my_notifications=my_notifications,
         total_events=total_events,
@@ -611,60 +656,143 @@ def dashboard():
     )
 
 # ==========================================
-# ROTAS DO ESTOQUE (ESTILO BAR) & LEILÕES
+# ROTAS DA ABA 1: ESTOQUE (CADASTRO, LISTA SUSPENSA E ENTRADAS POR DATA)
 # ==========================================
-@app.route("/inventory/add", methods=["POST"])
+@app.route("/inventory/create_new", methods=["POST"])
 @admin_required
-def add_inventory():
+def create_new_inventory_item():
+    """Cadastra um item inédito (ou soma se já existir), define seu Valor em TKP e registra a 1ª data de chegada."""
     item_name = request.form.get("item_name", "").strip()
     rarity = request.form.get("rarity", "Raro").strip()
+    tkp_value = int(request.form.get("tkp_value") or 100)
     qty = int(request.form.get("quantity") or 1)
     boss_source = request.form.get("boss_source", "").strip()
-    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    arrival_Input = request.form.get("arrival_date", "").strip()
+
+    if arrival_Input:
+        try:
+            dt_obj = datetime.strptime(arrival_Input, "%Y-%m-%dT%H:%M")
+            arrival_str = dt_obj.strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            arrival_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    else:
+        arrival_str = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     if not item_name or qty <= 0:
-        flash("Informe o nome do item e uma quantidade válida.", "warning")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash("Informe o nome do item e uma quantidade inicial válida.", "warning")
+        return redirect(url_for("dashboard", tab="estoque"))
 
     existing = db_execute(
         "SELECT * FROM inventory_items WHERE LOWER(item_name) = LOWER(?)",
         (item_name,), fetchone=True
     )
+
     if existing:
+        item_id = existing["id"]
         new_qty = int(existing["stock_qty"]) + qty
         db_execute("""
             UPDATE inventory_items
-            SET stock_qty = ?, rarity = ?, boss_source = ?, updated_at = ?
+            SET stock_qty = ?, rarity = ?, tkp_value = ?, boss_source = ?, updated_at = ?
             WHERE id = ?
-        """, (new_qty, rarity, boss_source or existing["boss_source"], now_str, existing["id"]))
-        flash(f"Estoque acumulado! '{existing['item_name']}' recebeu +{qty} e agora possui {new_qty} un. no estoque.", "success")
+        """, (new_qty, rarity, tkp_value, boss_source or existing["boss_source"], arrival_str, item_id))
+        item_real_name = existing["item_name"]
     else:
         db_execute("""
-            INSERT INTO inventory_items (item_name, rarity, stock_qty, boss_source, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (item_name, rarity, qty, boss_source, now_str))
-        flash(f"Novo item '{item_name}' cadastrado no estoque com {qty} un.!", "success")
+            INSERT INTO inventory_items (item_name, rarity, tkp_value, stock_qty, boss_source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (item_name, rarity, tkp_value, qty, boss_source, arrival_str))
+        created = db_execute("SELECT * FROM inventory_items WHERE LOWER(item_name) = LOWER(?)", (item_name,), fetchone=True)
+        item_id = created["id"]
+        item_real_name = created["item_name"]
 
-    return redirect(url_for("dashboard", tab="drops"))
+    # Registra a entrada na tabela de histórico por data de chegada
+    db_execute("""
+        INSERT INTO inventory_entries (item_id, item_name, rarity, tkp_value, qty_added, boss_source, arrival_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (item_id, item_real_name, rarity, tkp_value, qty, boss_source, arrival_str))
 
-@app.route("/inventory/<int:item_id>/adjust", methods=["POST"])
+    flash(f"Item '{item_real_name}' ({tkp_value} TKP) registrado com +{qty} un. na data {arrival_str} e adicionado à Lista Suspensa!", "success")
+    return redirect(url_for("dashboard", tab="estoque"))
+
+@app.route("/inventory/add_from_dropdown", methods=["POST"])
 @admin_required
-def adjust_inventory(item_id):
-    delta = int(request.form.get("delta") or 0)
+def add_stock_from_dropdown():
+    """Seleciona um item da Lista Suspensa, acumula a quantidade no saldo e grava nova entrada com a data de chegada."""
+    item_id = int(request.form.get("item_id") or 0)
+    qty = int(request.form.get("quantity") or 1)
+    boss_source = request.form.get("boss_source", "").strip()
+    custom_tkp = request.form.get("tkp_value", "").strip()
+    arrival_input = request.form.get("arrival_date", "").strip()
+
     item = db_execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,), fetchone=True)
-    if item:
-        new_qty = max(0, int(item["stock_qty"]) + delta)
-        now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-        db_execute("UPDATE inventory_items SET stock_qty = ?, updated_at = ? WHERE id = ?", (new_qty, now_str, item_id))
-    return redirect(url_for("dashboard", tab="drops"))
+    if not item or qty <= 0:
+        flash("Selecione um item válido na lista suspensa e informe a quantidade.", "warning")
+        return redirect(url_for("dashboard", tab="estoque"))
 
-@app.route("/inventory/<int:item_id>/delete", methods=["POST"])
+    if arrival_input:
+        try:
+            dt_obj = datetime.strptime(arrival_input, "%Y-%m-%dT%H:%M")
+            arrival_str = dt_obj.strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            arrival_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    else:
+        arrival_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    tkp_val = int(custom_tkp) if custom_tkp.isdigit() else int(item.get("tkp_value") or 100)
+    new_total_qty = int(item["stock_qty"]) + qty
+    final_boss = boss_source if boss_source else (item.get("boss_source") or "")
+
+    db_execute("""
+        UPDATE inventory_items
+        SET stock_qty = ?, tkp_value = ?, boss_source = ?, updated_at = ?
+        WHERE id = ?
+    """, (new_total_qty, tkp_val, final_boss, arrival_str, item_id))
+
+    db_execute("""
+        INSERT INTO inventory_entries (item_id, item_name, rarity, tkp_value, qty_added, boss_source, arrival_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (item_id, item["item_name"], item["rarity"], tkp_val, qty, final_boss, arrival_str))
+
+    flash(
+        f"Entrada registrada em {arrival_str}: +{qty} un. de '{item['item_name']}' ({tkp_val} TKP). "
+        f"Total acumulado para saque: {new_total_qty} un.!",
+        "success"
+    )
+    return redirect(url_for("dashboard", tab="estoque"))
+
+@app.route("/inventory/entry/<int:entry_id>/delete", methods=["POST"])
 @admin_required
-def delete_inventory(item_id):
-    db_execute("DELETE FROM inventory_items WHERE id = ?", (item_id,))
-    flash("Item removido do estoque.", "info")
-    return redirect(url_for("dashboard", tab="drops"))
+def delete_stock_entry(entry_id):
+    """Remove um lançamento de chegada específico e desconta a quantidade correspondente do saldo disponível."""
+    entry = db_execute("SELECT * FROM inventory_entries WHERE id = ?", (entry_id,), fetchone=True)
+    if entry:
+        item = db_execute("SELECT * FROM inventory_items WHERE id = ?", (entry["item_id"],), fetchone=True)
+        if item:
+            new_qty = max(0, int(item["stock_qty"]) - int(entry["qty_added"]))
+            db_execute("UPDATE inventory_items SET stock_qty = ? WHERE id = ?", (new_qty, item["id"]))
+        db_execute("DELETE FROM inventory_entries WHERE id = ?", (entry_id,))
+        flash(f"Entrada de {entry['qty_added']}x '{entry['item_name']}' ({entry['arrival_date']}) estornada do estoque.", "info")
+    return redirect(url_for("dashboard", tab="estoque"))
 
+@app.route("/inventory/item/<int:item_id>/update_tkp", methods=["POST"])
+@admin_required
+def update_item_tkp(item_id):
+    new_tkp = int(request.form.get("tkp_value") or 0)
+    db_execute("UPDATE inventory_items SET tkp_value = ? WHERE id = ?", (new_tkp, item_id))
+    flash("Valor em TKP do item atualizado!", "success")
+    return redirect(url_for("dashboard", tab="saque"))
+
+@app.route("/inventory/item/<int:item_id>/delete_catalog", methods=["POST"])
+@admin_required
+def delete_catalog_item(item_id):
+    db_execute("DELETE FROM inventory_entries WHERE item_id = ?", (item_id,))
+    db_execute("DELETE FROM inventory_items WHERE id = ?", (item_id,))
+    flash("Item e seu histórico de entradas foram removidos.", "info")
+    return redirect(url_for("dashboard", tab="saque"))
+
+# ==========================================
+# ROTAS DA ABA 2: DROPS DISPONÍVEIS PARA SAQUE & LANCES EM TKP
+# ==========================================
 @app.route("/auctions/start", methods=["POST"])
 @admin_required
 def start_auction():
@@ -675,10 +803,9 @@ def start_auction():
 
     item = db_execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,), fetchone=True)
     if not item or int(item["stock_qty"]) < qty_to_auction or qty_to_auction <= 0:
-        flash("Quantidade insuficiente no estoque para liberar este lance.", "danger")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash("Quantidade insuficiente disponível para liberar este saque.", "danger")
+        return redirect(url_for("dashboard", tab="saque"))
 
-    # Abate do estoque imediatamente
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     db_execute(
         "UPDATE inventory_items SET stock_qty = stock_qty - ?, updated_at = ? WHERE id = ?",
@@ -695,8 +822,8 @@ def start_auction():
         ) VALUES (?, ?, ?, ?, ?, ?, 'Aberto', 1, ?, ?, '', ?)
     """, (item_id, item["item_name"], item["rarity"], qty_to_auction, min_bid, min_bid, ends_epoch, ends_str, now_str))
 
-    flash(f"Lance liberado para '{item['item_name']} (x{qty_to_auction})'! Tempo limite: {duration_minutes} min.", "success")
-    return redirect(url_for("dashboard", tab="drops"))
+    flash(f"Saque/Lance liberado para '{item['item_name']} (x{qty_to_auction})' valendo a partir de {min_bid} TKP! Tempo: {duration_minutes} min.", "success")
+    return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/bid", methods=["POST"])
 @login_required
@@ -705,29 +832,29 @@ def place_bid(auction_id):
 
     auc = db_execute("SELECT * FROM auctions WHERE id = ?", (auction_id,), fetchone=True)
     if not auc or auc["status"] not in ("Aberto", "Em Desempate"):
-        flash("Este leilão já foi encerrado.", "warning")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash("Este lance já foi encerrado.", "warning")
+        return redirect(url_for("dashboard", tab="saque"))
 
     uid = session["user_id"]
     if auc["status"] == "Em Desempate":
         allowed = [x.strip() for x in (auc.get("tied_user_ids") or "").split(",") if x.strip()]
         if str(uid) not in allowed:
             flash("Apenas os jogadores que empataram podem dar lances nesta rodada de desempate de 6 minutos!", "danger")
-            return redirect(url_for("dashboard", tab="drops"))
+            return redirect(url_for("dashboard", tab="saque"))
 
     try:
         bid_amount = int(request.form.get("bid_amount") or 0)
     except ValueError:
-        flash("Valor de lance inválido.", "danger")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash("Valor de lance em TKP inválido.", "danger")
+        return redirect(url_for("dashboard", tab="saque"))
 
     min_allowed = int(auc["min_bid"])
     if auc["status"] == "Em Desempate" and bid_amount <= min_allowed:
-        flash(f"No desempate, o seu lance precisa ser maior que o valor empatado ({min_allowed})!", "warning")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash(f"No desempate, o seu lance precisa ser maior que o valor empatado ({min_allowed} TKP)!", "warning")
+        return redirect(url_for("dashboard", tab="saque"))
     elif bid_amount < min_allowed:
-        flash(f"O lance mínimo inicial é {min_allowed}.", "warning")
-        return redirect(url_for("dashboard", tab="drops"))
+        flash(f"O lance mínimo inicial é {min_allowed} TKP.", "warning")
+        return redirect(url_for("dashboard", tab="saque"))
 
     rnd = int(auc["round_number"] or 1)
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -739,8 +866,8 @@ def place_bid(auction_id):
 
     if existing_bid:
         if bid_amount <= int(existing_bid["bid_amount"]):
-            flash(f"Você já tem um lance de {existing_bid['bid_amount']} nesta rodada. Digite um valor maior para atualizar.", "warning")
-            return redirect(url_for("dashboard", tab="drops"))
+            flash(f"Você já tem um lance de {existing_bid['bid_amount']} TKP nesta rodada. Digite um valor maior.", "warning")
+            return redirect(url_for("dashboard", tab="saque"))
         db_execute(
             "UPDATE auction_bids SET bid_amount = ?, bid_time = ? WHERE id = ?",
             (bid_amount, now_str, existing_bid["id"])
@@ -754,15 +881,15 @@ def place_bid(auction_id):
     if bid_amount > int(auc["current_highest_bid"]):
         db_execute("UPDATE auctions SET current_highest_bid = ? WHERE id = ?", (bid_amount, auction_id))
 
-    flash(f"Lance de {bid_amount} registrado com sucesso em '{auc['item_name']}'!", "success")
-    return redirect(url_for("dashboard", tab="drops"))
+    flash(f"Lance de {bid_amount} TKP registrado com sucesso em '{auc['item_name']}'!", "success")
+    return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/force_end", methods=["POST"])
 @admin_required
 def force_end_auction(auction_id):
     resolve_expired_auctions(force_auction_id=auction_id)
     flash("Tempo do lance encerrado e apurado pelo Admin!", "info")
-    return redirect(url_for("dashboard", tab="drops"))
+    return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/confirm_delivery", methods=["POST"])
 @admin_required
@@ -777,22 +904,21 @@ def confirm_delivery(auction_id):
         if auc.get("winner_user_id"):
             create_notification(
                 auc["winner_user_id"],
-                f"✅ Entrega Confirmada (OK): O item '{auc['item_name']} (x{auc['qty']})' foi entregue a você in-game pelo Admin!"
+                f"✅ Entrega Confirmada (OK): O item '{auc['item_name']} (x{auc['qty']})' arrematado por {auc['winning_bid']} TKP foi entregue in-game pelo Admin!"
             )
         flash(f"Entrega do item '{auc['item_name']}' confirmada com OK!", "success")
-    return redirect(url_for("dashboard", tab="drops"))
+    return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/delete", methods=["POST"])
 @admin_required
 def delete_auction(auction_id):
     auc = db_execute("SELECT * FROM auctions WHERE id = ?", (auction_id,), fetchone=True)
     if auc and auc["status"] in ("Aberto", "Em Desempate"):
-        # Se cancelar um leilão aberto, devolve o item ao estoque
         db_execute("UPDATE inventory_items SET stock_qty = stock_qty + ? WHERE id = ?", (auc["qty"], auc["item_id"]))
     db_execute("DELETE FROM auction_bids WHERE auction_id = ?", (auction_id,))
     db_execute("DELETE FROM auctions WHERE id = ?", (auction_id,))
     flash("Registro de lance removido.", "info")
-    return redirect(url_for("dashboard", tab="drops"))
+    return redirect(url_for("dashboard", tab="saque"))
 
 # ==========================================
 # ROTAS DE EVENTOS, PLAYERS E TS3
@@ -1000,7 +1126,7 @@ LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Login - Painel TS3 & Drops</title>
+    <title>Login - Painel TS3, Estoque & Saque TKP</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -1038,7 +1164,7 @@ LOGIN_HTML = """
     <div class="login-card">
         <div class="brand-icon"><i class="fa-solid fa-headset"></i></div>
         <h4 class="text-center fw-bold mb-1">TS3 Guild Tracker</h4>
-        <p class="text-center text-secondary small mb-4">Presença TeamSpeak 3, Estoque & Leilão de Drops</p>
+        <p class="text-center text-secondary small mb-4">Presença TS3, Estoque por Data & Saques em TKP</p>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
@@ -1078,7 +1204,7 @@ MAIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>TS3 Guild Tracker - Estoque & Leilões</title>
+    <title>TS3 Guild Tracker - Estoque & Saque TKP</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -1091,7 +1217,8 @@ MAIN_HTML = """
         .badge-raridade-Raro { background-color: #0284c7; }
         .badge-raridade-Épico { background-color: #7c3aed; }
         .badge-raridade-Lendário { background-color: #d97706; color: #fff; }
-        .table-dark-custom th { background-color: #1a2234; color: #94a3b8; font-size: 0.80rem; text-transform: uppercase; }
+        .badge-tkp { background: linear-gradient(135deg, #f59e0b, #b45309); color: #fff; font-weight: 700; }
+        .table-dark-custom th { background-color: #1a2234; color: #94a3b8; font-size: 0.78rem; text-transform: uppercase; }
         .auction-active-card { border: 1px solid #3b82f6; box-shadow: 0 0 20px rgba(59, 130, 246, 0.12); }
         .auction-tie-card { border: 2px solid #f59e0b; box-shadow: 0 0 22px rgba(245, 158, 11, 0.22); }
         .timer-box { font-family: monospace; font-size: 1.25rem; font-weight: 700; letter-spacing: 1px; }
@@ -1125,12 +1252,12 @@ MAIN_HTML = """
 
 <div class="container pb-5">
 
-    <!-- PAINEL DE NOTIFICAÇÕES DE LANCES VENCIDOS / DESEMPATES -->
+    <!-- PAINEL DE NOTIFICAÇÕES DE SAQUES / DESEMPATES -->
     {% if my_notifications %}
     <div class="card border-warning bg-warning bg-opacity-10 p-3 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-2">
             <h6 class="fw-bold text-warning mb-0">
-                <i class="fa-solid fa-bell fa-shake me-1"></i> Suas Notificações de Lances & Entregas
+                <i class="fa-solid fa-bell fa-shake me-1"></i> Suas Notificações de Saques & Lances (TKP)
             </h6>
             <form method="POST" action="{{ url_for('read_notifications') }}">
                 <button type="submit" class="btn btn-sm btn-outline-warning py-0">Marcar como lidas</button>
@@ -1155,11 +1282,19 @@ MAIN_HTML = """
       {% endif %}
     {% endwith %}
 
-    <!-- NAVEGAÇÃO PRINCIPAL -->
-    <ul class="nav nav-pills gap-2 mb-4">
+    <!-- NAVEGAÇÃO PRINCIPAL POR ABAS -->
+    <ul class="nav nav-pills flex-wrap gap-2 mb-4">
         <li class="nav-item">
-            <a class="nav-link {% if tab == 'drops' %}active{% endif %}" href="{{ url_for('dashboard', tab='drops') }}">
-                <i class="fa-solid fa-gavel me-1"></i> Estoque & Lances de Drops
+            <a class="nav-link {% if tab == 'estoque' %}active{% endif %}" href="{{ url_for('dashboard', tab='estoque') }}">
+                <i class="fa-solid fa-boxes-stacked me-1"></i> Estoque (Entradas por Data)
+            </a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link {% if tab == 'saque' %}active{% endif %}" href="{{ url_for('dashboard', tab='saque') }}">
+                <i class="fa-solid fa-hand-holding-dollar me-1"></i> Drops Disponíveis para Saque
+                {% if available_drops %}
+                    <span class="badge bg-warning text-dark ms-1">{{ available_drops|length }}</span>
+                {% endif %}
             </a>
         </li>
         <li class="nav-item">
@@ -1186,29 +1321,75 @@ MAIN_HTML = """
         </li>
     </ul>
 
-    <!-- ==========================================
-         ABA 1: ESTOQUE (ESTILO BAR) & LEILÕES DE DROPS
-         ========================================== -->
-    {% if tab == 'drops' %}
+    <!-- ==========================================================
+         ABA 1: ESTOQUE (LISTA SUSPENSA + ENTRADAS POR DATA DE CHEGADA)
+         ========================================================== -->
+    {% if tab == 'estoque' %}
     <div class="row g-4">
 
-        <!-- COLUNA ESQUERDA: ESTOQUE ACUMULATIVO DO CLÃ -->
-        <div class="col-lg-5">
-            {% if session['role'] == 'admin' %}
-            <div class="card p-3 mb-4">
-                <h6 class="fw-bold mb-2">
-                    <i class="fa-solid fa-boxes-stacked text-warning me-1"></i> Entrada de Estoque (Acumulativo)
+        {% if session['role'] == 'admin' %}
+        <div class="col-lg-4">
+
+            <!-- CARD 1: INCLUIR MAIS NO ESTOQUE VIA LISTA SUSPENSA (DROPDOWN) -->
+            <div class="card p-3 mb-4 border-primary">
+                <h6 class="fw-bold text-info mb-1">
+                    <i class="fa-solid fa-list-check me-1"></i> Incluir Mais no Estoque (Lista Suspensa)
                 </h6>
                 <p class="text-secondary small mb-3">
-                    Se o item já existir no estoque, a quantidade digitada será <strong>somada</strong> ao saldo atual automaticamente.
+                    Selecione um item já cadastrado para acumular mais unidades registrando a data de chegada.
                 </p>
-                <form method="POST" action="{{ url_for('add_inventory') }}">
+                <form method="POST" action="{{ url_for('add_stock_from_dropdown') }}">
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nome do Item (Drop)</label>
-                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Joia da Criação / Espada +15" required>
+                        <label class="form-label small text-secondary mb-1">Selecionar Item Cadastrado</label>
+                        <select name="item_id" id="dropdownItemSelect" class="form-select form-select-sm bg-dark text-light border-secondary" required onchange="syncDropdownTkp(this)">
+                            <option value="" data-tkp="">-- Escolha o item na lista --</option>
+                            {% for it in catalog_items %}
+                            <option value="{{ it.id }}" data-tkp="{{ it.tkp_value }}">
+                                {{ it.item_name }} ({{ it.rarity }} | {{ it.tkp_value }} TKP | Saldo: {{ it.stock_qty }})
+                            </option>
+                            {% endfor %}
+                        </select>
                     </div>
                     <div class="row g-2 mb-2">
-                        <div class="col-7">
+                        <div class="col-6">
+                            <label class="form-label small text-secondary mb-1">Qtd que Chegou</label>
+                            <input type="number" name="quantity" value="1" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label small text-secondary mb-1">Valor Unit. (TKP)</label>
+                            <input type="number" name="tkp_value" id="dropdownTkpInput" min="0" placeholder="Padrão do item" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary">
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Data/Hora de Chegada (Opcional)</label>
+                        <input type="datetime-local" name="arrival_date" class="form-control form-control-sm bg-dark text-light border-secondary">
+                        <div class="form-text text-secondary" style="font-size: 0.7rem;">Deixe em branco para usar a data/hora de agora.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary mb-1">Boss / Origem da Entrada</label>
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Boss Kundun / Evento 21h">
+                    </div>
+                    <button type="submit" class="btn btn-info btn-sm w-100 fw-bold text-dark" {% if not catalog_items %}disabled{% endif %}>
+                        <i class="fa-solid fa-layer-group me-1"></i> Acumular Quantidade no Estoque
+                    </button>
+                </form>
+            </div>
+
+            <!-- CARD 2: CADASTRAR NOVO ITEM NO CATÁLOGO + QUANTIDADE INICIAL -->
+            <div class="card p-3">
+                <h6 class="fw-bold text-warning mb-1">
+                    <i class="fa-solid fa-plus-circle me-1"></i> Cadastrar Novo Item + Qtd Inicial
+                </h6>
+                <p class="text-secondary small mb-3">
+                    Cadastre um item inédito com seu valor em <strong>TKP</strong>. Ele ficará salvo na lista suspensa acima para futuras entradas.
+                </p>
+                <form method="POST" action="{{ url_for('create_new_inventory_item') }}">
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Nome do Novo Item (Drop)</label>
+                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Espada Lendária +15" required>
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-4">
                             <label class="form-label small text-secondary mb-1">Raridade</label>
                             <select name="rarity" class="form-select form-select-sm bg-dark text-light border-secondary">
                                 <option value="Comum">Comum</option>
@@ -1217,105 +1398,99 @@ MAIN_HTML = """
                                 <option value="Lendário">Lendário</option>
                             </select>
                         </div>
-                        <div class="col-5">
-                            <label class="form-label small text-secondary mb-1">Qtd a Somar</label>
+                        <div class="col-4">
+                            <label class="form-label small text-secondary mb-1">Qtd Inicial</label>
                             <input type="number" name="quantity" value="1" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                         </div>
+                        <div class="col-4">
+                            <label class="form-label small text-secondary mb-1">Valor (TKP)</label>
+                            <input type="number" name="tkp_value" value="100" min="0" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" required>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Data/Hora de Chegada (Opcional)</label>
+                        <input type="datetime-local" name="arrival_date" class="form-control form-control-sm bg-dark text-light border-secondary">
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Boss / Origem (Opcional)</label>
-                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Boss Kundun">
+                        <label class="form-label small text-secondary mb-1">Boss / Origem</label>
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Dragão Vermelho">
                     </div>
                     <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">
-                        <i class="fa-solid fa-cart-plus me-1"></i> Somar ao Estoque
+                        <i class="fa-solid fa-box-archive me-1"></i> Cadastrar Item & Gerar 1ª Entrada
                     </button>
                 </form>
             </div>
-            {% endif %}
 
-            <!-- TABELA DE ESTOQUE ATUAL -->
+        </div>
+        {% endif %}
+
+        <!-- TABELA DO ESTOQUE POR DATA DE CHEGADA -->
+        <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
             <div class="card p-3">
-                <h6 class="fw-bold mb-3">
-                    <i class="fa-solid fa-warehouse text-info me-1"></i> Estoque Disponível no Clã ({{ inventory|length }} itens)
-                </h6>
+                <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+                    <div>
+                        <h6 class="fw-bold mb-0">
+                            <i class="fa-solid fa-calendar-days text-info me-1"></i> Registro do Estoque por Data de Chegada ({{ stock_entries|length }} entradas)
+                        </h6>
+                        <small class="text-secondary">
+                            Histórico detalhado de cada lote que entrou no estoque conforme a data de chegada e quantidade.
+                        </small>
+                    </div>
+                    <a href="{{ url_for('dashboard', tab='saque') }}" class="btn btn-sm btn-outline-warning">
+                        <i class="fa-solid fa-hand-holding-dollar me-1"></i> Ver Consolidado para Saque
+                    </a>
+                </div>
+
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
-                                <th>Item</th>
-                                <th class="text-center">Saldo</th>
+                                <th>Data de Chegada</th>
+                                <th>Item / Raridade</th>
+                                <th>Boss / Origem</th>
+                                <th class="text-center">Qtd na Chegada</th>
+                                <th class="text-center">Valor Unit. (TKP)</th>
+                                <th class="text-center">Total Lote (TKP)</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Liberar Lance / Ajuste</th>
+                                <th class="text-end">Estornar</th>
                                 {% endif %}
                             </tr>
                         </thead>
                         <tbody>
-                            {% for item in inventory %}
+                            {% for entry in stock_entries %}
                             <tr>
+                                <td class="small text-info fw-semibold">
+                                    <i class="fa-regular fa-clock me-1"></i>{{ entry.arrival_date }}
+                                </td>
                                 <td>
-                                    <span class="badge badge-raridade-{{ item.rarity }} me-1">{{ item.rarity }}</span>
-                                    <strong>{{ item.item_name }}</strong>
-                                    {% if item.boss_source %}
-                                        <div class="text-secondary" style="font-size: 0.72rem;">Origem: {{ item.boss_source }}</div>
-                                    {% endif %}
+                                    <span class="badge badge-raridade-{{ entry.rarity }} me-1">{{ entry.rarity }}</span>
+                                    <strong>{{ entry.item_name }}</strong>
+                                </td>
+                                <td class="small text-secondary">{{ entry.boss_source or '—' }}</td>
+                                <td class="text-center">
+                                    <span class="badge bg-success fs-6">+{{ entry.qty_added }} un.</span>
                                 </td>
                                 <td class="text-center">
-                                    <span class="badge {% if item.stock_qty > 0 %}bg-success{% else %}bg-secondary{% endif %} fs-6">
-                                        {{ item.stock_qty }}
-                                    </span>
+                                    <span class="badge badge-tkp">{{ entry.tkp_value }} TKP</span>
+                                </td>
+                                <td class="text-center fw-bold text-warning">
+                                    {{ entry.qty_added * entry.tkp_value }} TKP
                                 </td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
-                                    <div class="d-flex justify-content-end align-items-center gap-1">
-                                        {% if item.stock_qty > 0 %}
-                                        <button class="btn btn-sm btn-primary py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#releaseBox{{ item.id }}">
-                                            <i class="fa-solid fa-gavel me-1"></i> Liberar
+                                    <form method="POST" action="{{ url_for('delete_stock_entry', entry_id=entry.id) }}" onsubmit="return confirm('Estornar esta entrada de {{ entry.qty_added }} un. do estoque?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2" title="Excluir entrada e descontar do saldo">
+                                            <i class="fa-solid fa-trash"></i>
                                         </button>
-                                        {% endif %}
-                                        <form method="POST" action="{{ url_for('adjust_inventory', item_id=item.id) }}" class="d-inline">
-                                            <input type="hidden" name="delta" value="1">
-                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2" title="Somar +1">+1</button>
-                                        </form>
-                                        <form method="POST" action="{{ url_for('adjust_inventory', item_id=item.id) }}" class="d-inline">
-                                            <input type="hidden" name="delta" value="-1">
-                                            <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Reduzir -1">-1</button>
-                                        </form>
-                                        <form method="POST" action="{{ url_for('delete_inventory', item_id=item.id) }}" class="d-inline" onsubmit="return confirm('Excluir item do estoque?');">
-                                            <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
-                                                <i class="fa-solid fa-trash"></i>
-                                            </button>
-                                        </form>
-                                    </div>
+                                    </form>
                                 </td>
                                 {% endif %}
                             </tr>
-                            {% if session['role'] == 'admin' and item.stock_qty > 0 %}
-                            <tr class="collapse" id="releaseBox{{ item.id }}">
-                                <td colspan="3" class="bg-black p-2 border-secondary">
-                                    <form method="POST" action="{{ url_for('start_auction') }}" class="row g-2 align-items-end">
-                                        <input type="hidden" name="item_id" value="{{ item.id }}">
-                                        <div class="col-3">
-                                            <label class="small text-secondary" style="font-size:0.7rem;">Qtd Lote</label>
-                                            <input type="number" name="qty" value="1" min="1" max="{{ item.stock_qty }}" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                                        </div>
-                                        <div class="col-4">
-                                            <label class="small text-secondary" style="font-size:0.7rem;">Lance Inicial</label>
-                                            <input type="number" name="min_bid" value="100" min="0" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                                        </div>
-                                        <div class="col-3">
-                                            <label class="small text-secondary" style="font-size:0.7rem;">Tempo (Min)</label>
-                                            <input type="number" name="duration_minutes" value="15" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                                        </div>
-                                        <div class="col-2">
-                                            <button type="submit" class="btn btn-sm btn-success w-100" title="Iniciar Disputa">OK</button>
-                                        </div>
-                                    </form>
-                                </td>
-                            </tr>
-                            {% endif %}
                             {% else %}
                             <tr>
-                                <td colspan="3" class="text-center text-secondary py-4">Estoque vazio. Adicione itens acima!</td>
+                                <td colspan="7" class="text-center text-secondary py-4">
+                                    Nenhuma entrada de estoque registrada ainda. Cadastre o primeiro item ao lado!
+                                </td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -1324,17 +1499,143 @@ MAIN_HTML = """
             </div>
         </div>
 
-        <!-- COLUNA DIREITA: LANCES ATIVOS E ENTREGAS IN-GAME -->
-        <div class="col-lg-7">
+    </div>
+    {% endif %}
 
-            <!-- 1. LANCES LIBERADOS / EM ANDAMENTO -->
+    <!-- ==========================================================
+         ABA 2: DROPS DISPONÍVEIS PARA SAQUE (SOMA DE TODAS AS DATAS + TKP)
+         ========================================================== -->
+    {% if tab == 'saque' %}
+    <div class="row g-4">
+
+        <!-- COLUNA ESQUERDA: CONSOLIDADO DE TODOS OS DROPS DISPONÍVEIS PARA SAQUE -->
+        <div class="col-lg-6">
+            <div class="card p-3">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h6 class="fw-bold text-warning mb-0">
+                        <i class="fa-solid fa-vault me-1"></i> Drops Disponíveis para Saque (Soma Total)
+                    </h6>
+                    <span class="badge bg-dark border border-secondary">
+                        {{ available_drops|length }} tipos disponíveis
+                    </span>
+                </div>
+                <p class="text-secondary small mb-3">
+                    Todos os drops disponíveis no momento <strong>somando todas as datas de entrada</strong>, com seu respectivo valor em <strong>TKP</strong>.
+                </p>
+
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
+                        <thead>
+                            <tr>
+                                <th>Drop / Item</th>
+                                <th class="text-center">Saldo Acumulado</th>
+                                <th class="text-center">Valor em TKP</th>
+                                {% if session['role'] == 'admin' %}
+                                <th class="text-end">Liberar Saque / Ações</th>
+                                {% endif %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for item in available_drops %}
+                            <tr>
+                                <td>
+                                    <span class="badge badge-raridade-{{ item.rarity }} me-1">{{ item.rarity }}</span>
+                                    <strong>{{ item.item_name }}</strong>
+                                    <div class="text-secondary" style="font-size: 0.72rem;">
+                                        Soma de {{ item.batches_count }} entrada(s) | Última: {{ item.updated_at }}
+                                    </div>
+                                </td>
+                                <td class="text-center">
+                                    <span class="badge bg-success fs-6">{{ item.stock_qty }} un.</span>
+                                </td>
+                                <td class="text-center">
+                                    <span class="badge badge-tkp fs-6">{{ item.tkp_value }} TKP</span>
+                                    <div class="text-secondary" style="font-size: 0.7rem;">
+                                        Total: {{ item.total_tkp_worth }} TKP
+                                    </div>
+                                </td>
+                                {% if session['role'] == 'admin' %}
+                                <td class="text-end">
+                                    <div class="d-flex justify-content-end gap-1">
+                                        <button class="btn btn-sm btn-warning fw-bold text-dark py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#saqueBox{{ item.id }}">
+                                            <i class="fa-solid fa-gavel me-1"></i> Liberar Lance
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-secondary py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#editTkpBox{{ item.id }}" title="Editar TKP">
+                                            <i class="fa-solid fa-pen"></i>
+                                        </button>
+                                    </div>
+                                </td>
+                                {% endif %}
+                            </tr>
+
+                            {% if session['role'] == 'admin' %}
+                            <!-- Painel expansível para liberar o item para saque/lance em TKP -->
+                            <tr class="collapse" id="saqueBox{{ item.id }}">
+                                <td colspan="4" class="bg-black p-3 border-warning">
+                                    <div class="small fw-bold text-warning mb-2">
+                                        <i class="fa-solid fa-bolt me-1"></i> Configurar Liberação de Lance para "{{ item.item_name }}"
+                                    </div>
+                                    <form method="POST" action="{{ url_for('start_auction') }}" class="row g-2 align-items-end">
+                                        <input type="hidden" name="item_id" value="{{ item.id }}">
+                                        <div class="col-3">
+                                            <label class="small text-secondary" style="font-size:0.72rem;">Qtd para Saque</label>
+                                            <input type="number" name="qty" value="1" min="1" max="{{ item.stock_qty }}" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                                        </div>
+                                        <div class="col-4">
+                                            <label class="small text-secondary" style="font-size:0.72rem;">Lance Mínimo (TKP)</label>
+                                            <input type="number" name="min_bid" value="{{ item.tkp_value }}" min="0" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" required>
+                                        </div>
+                                        <div class="col-3">
+                                            <label class="small text-secondary" style="font-size:0.72rem;">Tempo (Min)</label>
+                                            <input type="number" name="duration_minutes" value="15" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                                        </div>
+                                        <div class="col-2">
+                                            <button type="submit" class="btn btn-sm btn-success w-100 fw-bold">Abrir</button>
+                                        </div>
+                                    </form>
+                                </td>
+                            </tr>
+
+                            <!-- Painel expansível para editar o valor base em TKP do item -->
+                            <tr class="collapse" id="editTkpBox{{ item.id }}">
+                                <td colspan="4" class="bg-black p-2 border-secondary">
+                                    <div class="d-flex justify-content-between align-items-center">
+                                        <form method="POST" action="{{ url_for('update_item_tkp', item_id=item.id) }}" class="d-flex align-items-center gap-2">
+                                            <span class="small text-secondary">Novo Valor em TKP:</span>
+                                            <input type="number" name="tkp_value" value="{{ item.tkp_value }}" min="0" class="form-control form-control-sm bg-dark text-warning border-secondary" style="width: 110px;" required>
+                                            <button type="submit" class="btn btn-sm btn-info">Salvar TKP</button>
+                                        </form>
+                                        <form method="POST" action="{{ url_for('delete_catalog_item', item_id=item.id) }}" onsubmit="return confirm('Excluir este item permanentemente do catálogo?');">
+                                            <button type="submit" class="btn btn-sm btn-outline-danger">Excluir do Catálogo</button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endif %}
+                            {% else %}
+                            <tr>
+                                <td colspan="4" class="text-center text-secondary py-4">
+                                    Nenhum drop com saldo disponível para saque no momento. Adicione unidades na aba <strong>Estoque</strong>!
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- COLUNA DIREITA: DISPUTAS DE SAQUE ATIVAS (TKP) + FILA DE ENTREGA IN-GAME (OK) -->
+        <div class="col-lg-6">
+
+            <!-- 1. LANCES DE SAQUE ABERTOS / DESEMPATE 6 MIN -->
             <div class="card p-3 mb-4">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h6 class="fw-bold mb-0">
-                        <i class="fa-solid fa-fire text-danger me-1"></i> Lances Liberados pelo Admin (Ao Vivo)
+                        <i class="fa-solid fa-fire text-danger me-1"></i> Disputas de Saque Abertas (Lances em TKP)
                     </h6>
-                    <a href="{{ url_for('dashboard', tab='drops') }}" class="btn btn-sm btn-outline-secondary">
-                        <i class="fa-solid fa-rotate me-1"></i> Atualizar Lances
+                    <a href="{{ url_for('dashboard', tab='saque') }}" class="btn btn-sm btn-outline-secondary">
+                        <i class="fa-solid fa-rotate me-1"></i> Atualizar
                     </a>
                 </div>
 
@@ -1346,13 +1647,13 @@ MAIN_HTML = """
                             <div>
                                 <span class="badge badge-raridade-{{ a.rarity }} me-1">{{ a.rarity }}</span>
                                 <span class="fs-5 fw-bold">{{ a.item_name }}</span>
-                                <span class="badge bg-secondary ms-1">Lote x{{ a.qty }}</span>
+                                <span class="badge bg-secondary ms-1">x{{ a.qty }}</span>
                                 {% if a.status == 'Em Desempate' %}
                                     <span class="badge bg-warning text-dark ms-1">
                                         <i class="fa-solid fa-bolt me-1"></i> DESEMPATE 6 MIN (Rodada {{ a.round_number }})
                                     </span>
                                 {% else %}
-                                    <span class="badge bg-primary ms-1">Lances Abertos</span>
+                                    <span class="badge bg-primary ms-1">Saque Aberto</span>
                                 {% endif %}
                             </div>
 
@@ -1368,27 +1669,27 @@ MAIN_HTML = """
                         {% if a.status == 'Em Desempate' %}
                         <div class="alert alert-warning py-2 px-3 small mb-2">
                             <i class="fa-solid fa-triangle-exclamation me-1"></i>
-                            <strong>Empate detectado no valor de {{ a.min_bid }}!</strong>
-                            Prorrogação automática de <strong>6 minutos</strong> liberada exclusivamente para os empatantes:
+                            <strong>Empate em {{ a.min_bid }} TKP!</strong>
+                            Novo lance de <strong>6 minutos</strong> aberto exclusivamente para os empatantes:
                             <strong>{{ a.tied_names | join(', ') }}</strong>.
                         </div>
                         {% endif %}
 
                         <div class="row g-2 align-items-center bg-black bg-opacity-50 rounded p-2 mb-2">
                             <div class="col-sm-4">
-                                <small class="text-secondary d-block">Lance Mínimo / Base:</small>
-                                <strong class="text-light">{{ a.min_bid }}</strong>
+                                <small class="text-secondary d-block">Valor Base (TKP):</small>
+                                <strong class="text-warning">{{ a.min_bid }} TKP</strong>
                             </div>
                             <div class="col-sm-4">
                                 <small class="text-secondary d-block">Maior Lance Atual:</small>
-                                <strong class="text-success fs-5">{{ a.current_highest_bid }}</strong>
+                                <strong class="text-success fs-5">{{ a.current_highest_bid }} TKP</strong>
                             </div>
                             <div class="col-sm-4">
                                 {% if a.can_user_bid %}
                                 <form method="POST" action="{{ url_for('place_bid', auction_id=a.id) }}" class="d-flex gap-1">
                                     <input type="number" name="bid_amount"
                                            min="{% if a.status == 'Em Desempate' %}{{ a.min_bid + 1 }}{% else %}{{ a.min_bid }}{% endif %}"
-                                           placeholder="{% if a.status == 'Em Desempate' %}> {{ a.min_bid }}{% else %}Valor{% endif %}"
+                                           placeholder="TKP"
                                            class="form-control form-control-sm bg-dark text-light border-secondary" required>
                                     <button type="submit" class="btn btn-sm btn-success fw-bold text-nowrap">
                                         Dar Lance
@@ -1396,19 +1697,18 @@ MAIN_HTML = """
                                 </form>
                                 {% else %}
                                 <span class="badge bg-secondary w-100 py-2">
-                                    <i class="fa-solid fa-lock me-1"></i> Restrito aos Empatantes
+                                    <i class="fa-solid fa-lock me-1"></i> Só Empatantes
                                 </span>
                                 {% endif %}
                             </div>
                         </div>
 
-                        <!-- Lista de lances dados nesta rodada -->
                         <div class="d-flex flex-wrap justify-content-between align-items-center mt-1">
                             <div class="small text-secondary">
-                                <strong>Lances na rodada ({{ a.bids_list|length }}):</strong>
+                                <strong>Lances ({{ a.bids_list|length }}):</strong>
                                 {% for b in a.bids_list %}
                                     <span class="badge bg-secondary bg-opacity-50 text-light me-1">
-                                        {{ b.username }}: <strong>{{ b.bid_amount }}</strong> ({{ b.bid_time }})
+                                        {{ b.username }}: <strong class="text-warning">{{ b.bid_amount }} TKP</strong> ({{ b.bid_time }})
                                     </span>
                                 {% else %}
                                     <span>Nenhum lance registrado ainda.</span>
@@ -1418,11 +1718,11 @@ MAIN_HTML = """
                             {% if session['role'] == 'admin' %}
                             <div class="d-flex gap-1 mt-2 mt-sm-0">
                                 <form method="POST" action="{{ url_for('force_end_auction', auction_id=a.id) }}">
-                                    <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Encerrar o tempo agora e apurar vencedor/empate">
-                                        <i class="fa-solid fa-flag-checkered me-1"></i> Encerrar Tempo Agora
+                                    <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Encerrar tempo e apurar agora">
+                                        <i class="fa-solid fa-flag-checkered me-1"></i> Encerrar Agora
                                     </button>
                                 </form>
-                                <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Cancelar este leilão e devolver o item ao estoque?');">
+                                <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Cancelar e devolver o item ao saldo disponível?');">
                                     <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
                                         <i class="fa-solid fa-xmark"></i>
                                     </button>
@@ -1434,26 +1734,26 @@ MAIN_HTML = """
                     {% endfor %}
                 {% else %}
                     <p class="text-secondary small text-center py-3 mb-0">
-                        Nenhum lance aberto no momento. O Admin pode liberar itens do estoque ao lado.
+                        Nenhuma disputa de saque aberta agora. O Admin pode liberar qualquer item disponível ao lado!
                     </p>
                 {% endif %}
             </div>
 
-            <!-- 2. VENCEDORES AGUARDANDO ENTREGA IN-GAME E HISTÓRICO (OK DO ADMIN) -->
+            <!-- 2. VENCEDORES & ENTREGA IN-GAME (OK DO ADMIN) -->
             <div class="card p-3">
                 <h6 class="fw-bold mb-3">
-                    <i class="fa-solid fa-handshake-simple text-success me-1"></i> Vencedores & Confirmação de Entrega In-Game (OK)
+                    <i class="fa-solid fa-handshake-simple text-success me-1"></i> Saques Vencidos & Entrega In-Game (OK)
                 </h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
                                 <th>Item</th>
-                                <th>Vencedor (Nick TS3)</th>
+                                <th>Vencedor</th>
                                 <th>Lance Final</th>
-                                <th>Status Entrega</th>
+                                <th>Status</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Ação Admin</th>
+                                <th class="text-end">Confirmar</th>
                                 {% endif %}
                             </tr>
                         </thead>
@@ -1473,16 +1773,18 @@ MAIN_HTML = """
                                         <span class="text-secondary small">—</span>
                                     {% endif %}
                                 </td>
-                                <td class="fw-bold text-info">{{ a.winning_bid or '—' }}</td>
+                                <td>
+                                    {% if a.winning_bid %}
+                                        <span class="badge badge-tkp">{{ a.winning_bid }} TKP</span>
+                                    {% else %}
+                                        —
+                                    {% endif %}
+                                </td>
                                 <td>
                                     {% if a.status == 'Aguardando Entrega' %}
-                                        <span class="badge bg-warning text-dark">
-                                            <i class="fa-solid fa-hourglass-half me-1"></i> Aguardando Entrega In-Game
-                                        </span>
+                                        <span class="badge bg-warning text-dark">Aguardando Entrega</span>
                                     {% elif a.status == 'Entregue (OK)' %}
-                                        <span class="badge bg-success">
-                                            <i class="fa-solid fa-check-double me-1"></i> Entregue ({{ a.delivered_at }})
-                                        </span>
+                                        <span class="badge bg-success">OK ({{ a.delivered_at }})</span>
                                     {% else %}
                                         <span class="badge bg-secondary">{{ a.status }}</span>
                                     {% endif %}
@@ -1493,11 +1795,11 @@ MAIN_HTML = """
                                         {% if a.status == 'Aguardando Entrega' %}
                                         <form method="POST" action="{{ url_for('confirm_delivery', auction_id=a.id) }}">
                                             <button type="submit" class="btn btn-sm btn-success fw-bold py-0 px-2">
-                                                <i class="fa-solid fa-check me-1"></i> OK (Entregue)
+                                                <i class="fa-solid fa-check me-1"></i> OK
                                             </button>
                                         </form>
                                         {% endif %}
-                                        <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Remover este registro do histórico?');">
+                                        <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Remover registro?');">
                                             <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
                                                 <i class="fa-solid fa-trash"></i>
                                             </button>
@@ -1508,7 +1810,7 @@ MAIN_HTML = """
                             </tr>
                             {% else %}
                             <tr>
-                                <td colspan="5" class="text-center text-secondary py-3">Nenhum lance finalizado ainda.</td>
+                                <td colspan="5" class="text-center text-secondary py-3">Nenhum saque finalizado ainda.</td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -1520,9 +1822,9 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 2: EVENTOS & CHAMADA TS3
-         ========================================== -->
+    <!-- ==========================================================
+         ABA 3: EVENTOS & CHAMADA TS3
+         ========================================================== -->
     {% if tab == 'eventos' %}
     <div class="row g-4">
         <div class="col-lg-4">
@@ -1675,9 +1977,9 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 3: PLAYERS & RANKING
-         ========================================== -->
+    <!-- ==========================================================
+         ABA 4: PLAYERS & RANKING
+         ========================================================== -->
     {% if tab == 'players' %}
     <div class="row g-4">
         {% if session['role'] == 'admin' %}
@@ -1723,7 +2025,7 @@ MAIN_HTML = """
                                 <th>Nick no TS3</th>
                                 <th>Cargo</th>
                                 <th>Presenças ({{ total_events }} Eventos)</th>
-                                <th>Itens Arrematados</th>
+                                <th>Drops Sacados</th>
                                 {% if session['role'] == 'admin' %}
                                 <th class="text-end">Excluir</th>
                                 {% endif %}
@@ -1773,9 +2075,9 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 4: CONFIGURAR TS3
-         ========================================== -->
+    <!-- ==========================================================
+         ABA 5: CONFIGURAR TS3
+         ========================================================== -->
     {% if tab == 'tsconfig' and session['role'] == 'admin' %}
     <div class="row justify-content-center">
         <div class="col-lg-7">
@@ -1831,9 +2133,9 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================
-         ABA 5: MEU PERFIL
-         ========================================== -->
+    <!-- ==========================================================
+         ABA 6: MEU PERFIL
+         ========================================================== -->
     {% if tab == 'perfil' %}
     <div class="row justify-content-center">
         <div class="col-lg-5">
@@ -1865,7 +2167,17 @@ MAIN_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // Cronômetro regressivo em tempo real para os lances abertos e desempates de 6 min
+    // Preenche automaticamente o valor em TKP quando o Admin seleciona um item na lista suspensa
+    function syncDropdownTkp(selectEl) {
+        const opt = selectEl.options[selectEl.selectedIndex];
+        const tkp = opt ? opt.getAttribute('data-tkp') : '';
+        const input = document.getElementById('dropdownTkpInput');
+        if (input && tkp) {
+            input.value = tkp;
+        }
+    }
+
+    // Cronômetro regressivo em tempo real para os saques/lances abertos e desempates de 6 min
     function initTimers() {
         const timers = document.querySelectorAll('.timer-box');
         if (!timers.length) return;
