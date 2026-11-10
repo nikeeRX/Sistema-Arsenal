@@ -139,7 +139,7 @@ def init_db():
         )
     """)
 
-    # 4. Catálogo Consolidado de Itens (Soma de todas as entradas disponíveis para saque)
+    # 4. Catálogo Consolidado de Itens
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS inventory_items (
             id {id_col},
@@ -151,7 +151,6 @@ def init_db():
             updated_at VARCHAR(40)
         )
     """)
-    # Garante que a coluna tkp_value exista caso a tabela já tenha sido criada na versão anterior
     safe_add_column("inventory_items", "tkp_value INTEGER DEFAULT 100")
 
     # 5. Histórico de Entradas no Estoque por Data de Chegada
@@ -202,7 +201,7 @@ def init_db():
         )
     """)
 
-    # 8. Notificações de Vencedores e Desempates
+    # 8. Notificações
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS notifications (
             id {id_col},
@@ -212,24 +211,6 @@ def init_db():
             created_at VARCHAR(40)
         )
     """)
-
-    # Backfill: se já existiam itens cadastrados antes desta atualização sem registro de entrada, cria o registro inicial
-    existing_items = db_execute("SELECT * FROM inventory_items", fetch=True)
-    for it in existing_items:
-        has_entry = db_execute("SELECT id FROM inventory_entries WHERE item_id = ?", (it["id"],), fetchone=True)
-        if not has_entry and int(it.get("stock_qty") or 0) > 0:
-            db_execute("""
-                INSERT INTO inventory_entries (item_id, item_name, rarity, tkp_value, qty_added, boss_source, arrival_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                it["id"],
-                it["item_name"],
-                it.get("rarity", "Raro"),
-                int(it.get("tkp_value") or 100),
-                int(it["stock_qty"]),
-                it.get("boss_source", ""),
-                it.get("updated_at") or datetime.now().strftime("%d/%m/%Y %H:%M")
-            ))
 
     cfg = db_execute("SELECT id FROM ts_config WHERE id = 1", fetchone=True)
     if not cfg:
@@ -254,7 +235,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# MOTOR DE APURAÇÃO DE LANCES (TKP) E DESEMPATE (6 MIN)
+# MOTOR DE APURAÇÃO DE LANCES (TKP) E DESEMPATE
 # ==========================================
 def create_notification(user_id, message):
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -297,7 +278,6 @@ def resolve_expired_auctions(force_auction_id=None):
                     (new_end_epoch, new_end_str, aid)
                 )
             else:
-                # Devolve ao saldo disponível para saque se ninguém deu lance
                 db_execute(
                     "UPDATE inventory_items SET stock_qty = stock_qty + ? WHERE id = ?",
                     (auc["qty"], auc["item_id"])
@@ -331,13 +311,13 @@ def resolve_expired_auctions(force_auction_id=None):
 
             create_notification(
                 winner["user_id"],
-                f"🏆 Parabéns! Você venceu o saque do item '{auc['item_name']} (x{auc['qty']})' com o lance de {max_bid} TKP! Procure o Admin in-game para receber seu item."
+                f"🏆 Parabéns! Você venceu o saque do item '{auc['item_name']} (x{auc['qty']})' com o lance de {max_bid} TKP! Procure o Admin in-game."
             )
         else:
             tied_ids_str = ",".join(str(b["user_id"]) for b in top_bidders)
             tied_names = ", ".join(b["username"] for b in top_bidders)
             new_round = rnd + 1
-            new_end_epoch = int(time.time()) + 360  # 6 minutos (360 segundos)
+            new_end_epoch = int(time.time()) + 360  # 6 minutos
             new_end_str = datetime.fromtimestamp(new_end_epoch).strftime("%d/%m %H:%M:%S")
 
             db_execute("""
@@ -355,11 +335,11 @@ def resolve_expired_auctions(force_auction_id=None):
             for b in top_bidders:
                 create_notification(
                     b["user_id"],
-                    f"⚡ EMPATE no item '{auc['item_name']}' no valor de {max_bid} TKP (Empatados: {tied_names})! Uma nova rodada exclusiva de 6 minutos foi aberta a partir de {max_bid} TKP."
+                    f"⚡ EMPATE no item '{auc['item_name']}' em {max_bid} TKP (Empatados: {tied_names})! Nova rodada de 6 minutos iniciada."
                 )
 
 # ==========================================
-# INTEGRAÇÃO NATIVA TEAMSPEAK 3 SERVERQUERY
+# INTEGRAÇÃO TEAMSPEAK 3 SERVERQUERY
 # ==========================================
 def ts3_escape(text):
     if not text:
@@ -572,24 +552,34 @@ def dashboard():
     """, fetch=True)
     drop_counts = {r["winner_user_id"]: int(r["cnt"]) for r in won_rows}
 
+    # Cálculo do saldo de TKP de cada player (1 presença = +1 TKP, menos TKP gasto em saques entregues)
+    att_total_per_user = db_execute("SELECT user_id, COUNT(*) as cnt FROM attendance GROUP BY user_id", fetch=True)
+    tkp_earned_map = {r["user_id"]: int(r["cnt"]) for r in att_total_per_user}
+
+    tkp_spent_rows = db_execute("""
+        SELECT winner_user_id, SUM(winning_bid) as total_spent
+        FROM auctions
+        WHERE winner_user_id IS NOT NULL AND status = 'Entregue (OK)'
+        GROUP BY winner_user_id
+    """, fetch=True)
+    tkp_spent_map = {r["winner_user_id"]: int(r["total_spent"] or 0) for r in tkp_spent_rows}
+
     for u in users:
         presences = att_counts.get(u["id"], 0)
         u["presences"] = presences
         u["pct"] = round((presences / total_events) * 100, 1) if total_events > 0 else 0.0
         u["drops_won"] = drop_counts.get(u["id"], 0)
+        earned = tkp_earned_map.get(u["id"], 0)
+        spent = tkp_spent_map.get(u["id"], 0)
+        u["tkp_balance"] = max(0, earned - spent)
 
-    # 1. Catálogo completo de itens (para a lista suspensa e para o consolidado de saque)
     catalog_items = db_execute("SELECT * FROM inventory_items ORDER BY item_name ASC", fetch=True)
-
-    # 2. Histórico de Entradas no Estoque por Data de Chegada (Aba Estoque)
     stock_entries = db_execute("SELECT * FROM inventory_entries ORDER BY id DESC", fetch=True)
 
-    # Quantidade de lotes/entradas registradas por item
     entries_count_map = {}
     for e in stock_entries:
         entries_count_map[e["item_id"]] = entries_count_map.get(e["item_id"], 0) + 1
 
-    # 3. Drops Disponíveis para Saque (Soma consolidada de todas as datas de entrada com saldo > 0)
     available_drops = []
     for item in catalog_items:
         item["tkp_value"] = int(item.get("tkp_value") or 0)
@@ -599,7 +589,6 @@ def dashboard():
         if item["stock_qty"] > 0:
             available_drops.append(item)
 
-    # 4. Leilões / Saques ativos e histórico
     auctions = db_execute("""
         SELECT a.*, u.username as winner_name, u.ts_nick as winner_nick
         FROM auctions a
@@ -656,22 +645,21 @@ def dashboard():
     )
 
 # ==========================================
-# ROTAS DA ABA 1: ESTOQUE (CADASTRO, LISTA SUSPENSA E ENTRADAS POR DATA)
+# ROTAS DO ESTOQUE
 # ==========================================
 @app.route("/inventory/create_new", methods=["POST"])
 @admin_required
 def create_new_inventory_item():
-    """Cadastra um item inédito (ou soma se já existir), define seu Valor em TKP e registra a 1ª data de chegada."""
     item_name = request.form.get("item_name", "").strip()
     rarity = request.form.get("rarity", "Raro").strip()
     tkp_value = int(request.form.get("tkp_value") or 100)
     qty = int(request.form.get("quantity") or 1)
     boss_source = request.form.get("boss_source", "").strip()
-    arrival_Input = request.form.get("arrival_date", "").strip()
+    arrival_input = request.form.get("arrival_date", "").strip()
 
-    if arrival_Input:
+    if arrival_input:
         try:
-            dt_obj = datetime.strptime(arrival_Input, "%Y-%m-%dT%H:%M")
+            dt_obj = datetime.strptime(arrival_input, "%Y-%m-%dT%H:%M")
             arrival_str = dt_obj.strftime("%d/%m/%Y %H:%M")
         except ValueError:
             arrival_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -705,19 +693,17 @@ def create_new_inventory_item():
         item_id = created["id"]
         item_real_name = created["item_name"]
 
-    # Registra a entrada na tabela de histórico por data de chegada
     db_execute("""
         INSERT INTO inventory_entries (item_id, item_name, rarity, tkp_value, qty_added, boss_source, arrival_date)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (item_id, item_real_name, rarity, tkp_value, qty, boss_source, arrival_str))
 
-    flash(f"Item '{item_real_name}' ({tkp_value} TKP) registrado com +{qty} un. na data {arrival_str} e adicionado à Lista Suspensa!", "success")
+    flash(f"Item '{item_real_name}' ({tkp_value} TKP) registrado com +{qty} un. e adicionado à Lista Suspensa!", "success")
     return redirect(url_for("dashboard", tab="estoque"))
 
 @app.route("/inventory/add_from_dropdown", methods=["POST"])
 @admin_required
 def add_stock_from_dropdown():
-    """Seleciona um item da Lista Suspensa, acumula a quantidade no saldo e grava nova entrada com a data de chegada."""
     item_id = int(request.form.get("item_id") or 0)
     qty = int(request.form.get("quantity") or 1)
     boss_source = request.form.get("boss_source", "").strip()
@@ -753,17 +739,12 @@ def add_stock_from_dropdown():
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (item_id, item["item_name"], item["rarity"], tkp_val, qty, final_boss, arrival_str))
 
-    flash(
-        f"Entrada registrada em {arrival_str}: +{qty} un. de '{item['item_name']}' ({tkp_val} TKP). "
-        f"Total acumulado para saque: {new_total_qty} un.!",
-        "success"
-    )
+    flash(f"Entrada registrada: +{qty} un. de '{item['item_name']}' ({tkp_val} TKP). Saldo total: {new_total_qty} un.!", "success")
     return redirect(url_for("dashboard", tab="estoque"))
 
 @app.route("/inventory/entry/<int:entry_id>/delete", methods=["POST"])
 @admin_required
 def delete_stock_entry(entry_id):
-    """Remove um lançamento de chegada específico e desconta a quantidade correspondente do saldo disponível."""
     entry = db_execute("SELECT * FROM inventory_entries WHERE id = ?", (entry_id,), fetchone=True)
     if entry:
         item = db_execute("SELECT * FROM inventory_items WHERE id = ?", (entry["item_id"],), fetchone=True)
@@ -771,7 +752,7 @@ def delete_stock_entry(entry_id):
             new_qty = max(0, int(item["stock_qty"]) - int(entry["qty_added"]))
             db_execute("UPDATE inventory_items SET stock_qty = ? WHERE id = ?", (new_qty, item["id"]))
         db_execute("DELETE FROM inventory_entries WHERE id = ?", (entry_id,))
-        flash(f"Entrada de {entry['qty_added']}x '{entry['item_name']}' ({entry['arrival_date']}) estornada do estoque.", "info")
+        flash("Entrada estornada do estoque.", "info")
     return redirect(url_for("dashboard", tab="estoque"))
 
 @app.route("/inventory/item/<int:item_id>/update_tkp", methods=["POST"])
@@ -779,7 +760,7 @@ def delete_stock_entry(entry_id):
 def update_item_tkp(item_id):
     new_tkp = int(request.form.get("tkp_value") or 0)
     db_execute("UPDATE inventory_items SET tkp_value = ? WHERE id = ?", (new_tkp, item_id))
-    flash("Valor em TKP do item atualizado!", "success")
+    flash("Valor em TKP atualizado!", "success")
     return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/inventory/item/<int:item_id>/delete_catalog", methods=["POST"])
@@ -787,11 +768,11 @@ def update_item_tkp(item_id):
 def delete_catalog_item(item_id):
     db_execute("DELETE FROM inventory_entries WHERE item_id = ?", (item_id,))
     db_execute("DELETE FROM inventory_items WHERE id = ?", (item_id,))
-    flash("Item e seu histórico de entradas foram removidos.", "info")
+    flash("Item removido do catálogo.", "info")
     return redirect(url_for("dashboard", tab="saque"))
 
 # ==========================================
-# ROTAS DA ABA 2: DROPS DISPONÍVEIS PARA SAQUE & LANCES EM TKP
+# ROTAS DE SAQUE E LANCES EM TKP
 # ==========================================
 @app.route("/auctions/start", methods=["POST"])
 @admin_required
@@ -822,7 +803,7 @@ def start_auction():
         ) VALUES (?, ?, ?, ?, ?, ?, 'Aberto', 1, ?, ?, '', ?)
     """, (item_id, item["item_name"], item["rarity"], qty_to_auction, min_bid, min_bid, ends_epoch, ends_str, now_str))
 
-    flash(f"Saque/Lance liberado para '{item['item_name']} (x{qty_to_auction})' valendo a partir de {min_bid} TKP! Tempo: {duration_minutes} min.", "success")
+    flash(f"Saque liberado para '{item['item_name']} (x{qty_to_auction})' a partir de {min_bid} TKP!", "success")
     return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/bid", methods=["POST"])
@@ -839,7 +820,7 @@ def place_bid(auction_id):
     if auc["status"] == "Em Desempate":
         allowed = [x.strip() for x in (auc.get("tied_user_ids") or "").split(",") if x.strip()]
         if str(uid) not in allowed:
-            flash("Apenas os jogadores que empataram podem dar lances nesta rodada de desempate de 6 minutos!", "danger")
+            flash("Apenas os jogadores que empataram podem dar lances nesta rodada de desempate!", "danger")
             return redirect(url_for("dashboard", tab="saque"))
 
     try:
@@ -850,10 +831,10 @@ def place_bid(auction_id):
 
     min_allowed = int(auc["min_bid"])
     if auc["status"] == "Em Desempate" and bid_amount <= min_allowed:
-        flash(f"No desempate, o seu lance precisa ser maior que o valor empatado ({min_allowed} TKP)!", "warning")
+        flash(f"No desempate, o lance precisa ser maior que {min_allowed} TKP!", "warning")
         return redirect(url_for("dashboard", tab="saque"))
     elif bid_amount < min_allowed:
-        flash(f"O lance mínimo inicial é {min_allowed} TKP.", "warning")
+        flash(f"O lance mínimo é {min_allowed} TKP.", "warning")
         return redirect(url_for("dashboard", tab="saque"))
 
     rnd = int(auc["round_number"] or 1)
@@ -866,7 +847,7 @@ def place_bid(auction_id):
 
     if existing_bid:
         if bid_amount <= int(existing_bid["bid_amount"]):
-            flash(f"Você já tem um lance de {existing_bid['bid_amount']} TKP nesta rodada. Digite um valor maior.", "warning")
+            flash(f"Você já tem um lance de {existing_bid['bid_amount']} TKP. Digite um valor maior.", "warning")
             return redirect(url_for("dashboard", tab="saque"))
         db_execute(
             "UPDATE auction_bids SET bid_amount = ?, bid_time = ? WHERE id = ?",
@@ -881,14 +862,14 @@ def place_bid(auction_id):
     if bid_amount > int(auc["current_highest_bid"]):
         db_execute("UPDATE auctions SET current_highest_bid = ? WHERE id = ?", (bid_amount, auction_id))
 
-    flash(f"Lance de {bid_amount} TKP registrado com sucesso em '{auc['item_name']}'!", "success")
+    flash(f"Lance de {bid_amount} TKP registrado com sucesso!", "success")
     return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/force_end", methods=["POST"])
 @admin_required
 def force_end_auction(auction_id):
     resolve_expired_auctions(force_auction_id=auction_id)
-    flash("Tempo do lance encerrado e apurado pelo Admin!", "info")
+    flash("Tempo encerrado e apurado pelo Admin!", "info")
     return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/confirm_delivery", methods=["POST"])
@@ -904,9 +885,9 @@ def confirm_delivery(auction_id):
         if auc.get("winner_user_id"):
             create_notification(
                 auc["winner_user_id"],
-                f"✅ Entrega Confirmada (OK): O item '{auc['item_name']} (x{auc['qty']})' arrematado por {auc['winning_bid']} TKP foi entregue in-game pelo Admin!"
+                f"✅ Entrega Confirmada (OK): Item '{auc['item_name']}' entregue! {auc['winning_bid']} TKP descontados da sua carteira."
             )
-        flash(f"Entrega do item '{auc['item_name']}' confirmada com OK!", "success")
+        flash(f"Entrega confirmada! {auc['winning_bid']} TKP deduzidos do saldo do vencedor.", "success")
     return redirect(url_for("dashboard", tab="saque"))
 
 @app.route("/auctions/<int:auction_id>/delete", methods=["POST"])
@@ -917,11 +898,11 @@ def delete_auction(auction_id):
         db_execute("UPDATE inventory_items SET stock_qty = stock_qty + ? WHERE id = ?", (auc["qty"], auc["item_id"]))
     db_execute("DELETE FROM auction_bids WHERE auction_id = ?", (auction_id,))
     db_execute("DELETE FROM auctions WHERE id = ?", (auction_id,))
-    flash("Registro de lance removido.", "info")
+    flash("Registro removido.", "info")
     return redirect(url_for("dashboard", tab="saque"))
 
 # ==========================================
-# ROTAS DE EVENTOS, PLAYERS E TS3
+# ROTAS DE EVENTOS, PLAYERS E TS3 (COM 1 PRESENÇA = 1 TKP)
 # ==========================================
 @app.route("/events/create", methods=["POST"])
 @admin_required
@@ -934,7 +915,7 @@ def create_event():
             "INSERT INTO events (title, event_type, status, created_at) VALUES (?, ?, 'Aberto', ?)",
             (title, event_type, now_str)
         )
-        flash(f"Evento '{title}' criado! Agora você já pode puxar a presença do TS3.", "success")
+        flash(f"Evento '{title}' criado!", "success")
     return redirect(url_for("dashboard", tab="eventos"))
 
 @app.route("/events/<int:event_id>/delete", methods=["POST"])
@@ -942,7 +923,7 @@ def create_event():
 def delete_event(event_id):
     db_execute("DELETE FROM attendance WHERE event_id = ?", (event_id,))
     db_execute("DELETE FROM events WHERE id = ?", (event_id,))
-    flash("Evento excluído com sucesso.", "info")
+    flash("Evento excluído.", "info")
     return redirect(url_for("dashboard", tab="eventos"))
 
 @app.route("/events/<int:event_id>/sync_ts3", methods=["POST"])
@@ -968,22 +949,15 @@ def sync_event_ts3(event_id):
                 "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
                 (event_id, u["id"]), fetchone=True
             )
-            if existing:
-                db_execute(
-                    "UPDATE attendance SET ts_nick_found = ?, method = 'TS3 Auto', checked_at = ? WHERE id = ?",
-                    (found_nick, now_str, existing["id"])
-                )
-            else:
+            if not existing:
                 db_execute(
                     "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'TS3 Auto', ?)",
                     (event_id, u["id"], found_nick, now_str)
                 )
+                create_notification(u["id"], f"💰 Você ganhou +1 TKP por comparecer ao evento no TS3!")
 
     db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
-    msg = f"Varredura TS3 concluída! {len(online_nicks)} online no TS3 | {matched_count} jogadores marcados com presença."
-    if afk_nicks:
-        msg += f" ({len(afk_nicks)} ignorados em sala AFK)."
-    flash(msg, "success")
+    flash(f"Presença TS3 sincronizada! {matched_count} jogadores pontuaram +1 TKP.", "success")
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
 @app.route("/events/<int:event_id>/manual_paste", methods=["POST"])
@@ -1008,9 +982,10 @@ def manual_paste_ts3(event_id):
                     "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'Lista TS3', ?)",
                     (event_id, u["id"], found_nick, now_str)
                 )
+                create_notification(u["id"], f"💰 Você ganhou +1 TKP por presença manual!")
 
     db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
-    flash(f"{matched_count} presenças contabilizadas a partir da lista de nicks!", "success")
+    flash(f"{matched_count} presenças contabilizadas (+1 TKP cada)!", "success")
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
 @app.route("/events/<int:event_id>/toggle_user/<int:user_id>", methods=["POST"])
@@ -1022,6 +997,7 @@ def toggle_attendance(event_id, user_id):
     )
     if existing:
         db_execute("DELETE FROM attendance WHERE id = ?", (existing["id"],))
+        flash("Presença removida (TKP estornado).", "info")
     else:
         u = db_execute("SELECT ts_nick FROM users WHERE id = ?", (user_id,), fetchone=True)
         now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -1029,6 +1005,8 @@ def toggle_attendance(event_id, user_id):
             "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'Manual Admin', ?)",
             (event_id, user_id, u["ts_nick"] if u else "Manual", now_str)
         )
+        create_notification(user_id, f"💰 Você ganhou +1 TKP por presença concedida pelo Admin!")
+        flash("Presença adicionada (+1 TKP)!", "success")
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
 @app.route("/users/create", methods=["POST"])
@@ -1040,12 +1018,12 @@ def create_user():
     role = request.form.get("role", "player").strip()
 
     if not username or not password or not ts_nick:
-        flash("Preencha Login, Senha e Nick do TS3.", "warning")
+        flash("Preencha todos os campos.", "warning")
         return redirect(url_for("dashboard", tab="players"))
 
     exists = db_execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
     if exists:
-        flash(f"O login '{username}' já está cadastrado.", "danger")
+        flash("Login já cadastrado.", "danger")
         return redirect(url_for("dashboard", tab="players"))
 
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -1053,14 +1031,14 @@ def create_user():
         "INSERT INTO users (username, password_hash, ts_nick, role, created_at) VALUES (?, ?, ?, ?, ?)",
         (username, generate_password_hash(password), ts_nick, role, now_str)
     )
-    flash(f"Jogador '{username}' (Nick TS3: {ts_nick}) criado com sucesso!", "success")
+    flash("Jogador criado com sucesso!", "success")
     return redirect(url_for("dashboard", tab="players"))
 
 @app.route("/users/<int:user_id>/delete", methods=["POST"])
 @admin_required
 def delete_user(user_id):
     if user_id == session.get("user_id"):
-        flash("Você não pode excluir sua própria conta logada.", "warning")
+        flash("Você não pode excluir sua própria conta.", "warning")
         return redirect(url_for("dashboard", tab="players"))
 
     db_execute("DELETE FROM attendance WHERE user_id = ?", (user_id,))
@@ -1068,7 +1046,7 @@ def delete_user(user_id):
     db_execute("DELETE FROM notifications WHERE user_id = ?", (user_id,))
     db_execute("UPDATE auctions SET winner_user_id = NULL WHERE winner_user_id = ?", (user_id,))
     db_execute("DELETE FROM users WHERE id = ?", (user_id,))
-    flash("Jogador excluído do sistema.", "info")
+    flash("Jogador excluído.", "info")
     return redirect(url_for("dashboard", tab="players"))
 
 @app.route("/profile/update", methods=["POST"])
@@ -1084,7 +1062,7 @@ def update_profile():
     if new_pass:
         db_execute("UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(new_pass), uid))
 
-    flash("Seus dados foram atualizados com sucesso!", "success")
+    flash("Perfil atualizado!", "success")
     return redirect(url_for("dashboard", tab="perfil"))
 
 @app.route("/tsconfig/save", methods=["POST"])
@@ -1108,12 +1086,11 @@ def save_tsconfig():
         cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
         ok, res = fetch_ts3_online_clients(cfg)
         if ok:
-            nicks_str = ", ".join(res["online"]) if res["online"] else "Nenhum cliente de voz conectado agora"
-            flash(f"Conexão TS3 OK! Online nas salas válidas ({len(res['online'])}): {nicks_str}", "success")
+            flash(f"Conexão TS3 OK! ({len(res['online'])} online)", "success")
         else:
             flash(res, "danger")
     else:
-        flash("Configurações do TeamSpeak 3 salvas com sucesso!", "success")
+        flash("Configurações salvas!", "success")
 
     return redirect(url_for("dashboard", tab="tsconfig"))
 
@@ -1126,7 +1103,7 @@ LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Login - Painel TS3, Estoque & Saque TKP</title>
+    <title>Login - TS3 Guild Tracker</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -1164,7 +1141,7 @@ LOGIN_HTML = """
     <div class="login-card">
         <div class="brand-icon"><i class="fa-solid fa-headset"></i></div>
         <h4 class="text-center fw-bold mb-1">TS3 Guild Tracker</h4>
-        <p class="text-center text-secondary small mb-4">Presença TS3, Estoque por Data & Saques em TKP</p>
+        <p class="text-center text-secondary small mb-4">Presença TS3, Estoque & Moeda TKP</p>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
@@ -1176,7 +1153,7 @@ LOGIN_HTML = """
 
         <form method="POST">
             <div class="mb-3">
-                <label class="form-label small text-secondary">Login do Player / Admin</label>
+                <label class="form-label small text-secondary">Login</label>
                 <div class="input-group">
                     <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-user"></i></span>
                     <input type="text" name="username" class="form-control bg-dark text-light border-secondary" required autofocus>
@@ -1190,7 +1167,7 @@ LOGIN_HTML = """
                 </div>
             </div>
             <button type="submit" class="btn btn-primary w-100 fw-semibold py-2">
-                <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar no Sistema
+                <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar
             </button>
         </form>
     </div>
@@ -1239,6 +1216,9 @@ MAIN_HTML = """
                 <i class="fa-solid fa-user-shield me-1 text-info"></i>
                 <strong>{{ session['username'] }}</strong>
                 <span class="badge bg-secondary ms-1">TS3: {{ session['ts_nick'] }}</span>
+                {% for u in users if u.id == session['user_id'] %}
+                    <span class="badge badge-tkp ms-1"><i class="fa-solid fa-coins me-1"></i>{{ u.tkp_balance }} TKP</span>
+                {% endfor %}
                 {% if session['role'] == 'admin' %}
                     <span class="badge bg-primary ms-1">ADMIN</span>
                 {% endif %}
@@ -1252,12 +1232,11 @@ MAIN_HTML = """
 
 <div class="container pb-5">
 
-    <!-- PAINEL DE NOTIFICAÇÕES DE SAQUES / DESEMPATES -->
     {% if my_notifications %}
     <div class="card border-warning bg-warning bg-opacity-10 p-3 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-2">
             <h6 class="fw-bold text-warning mb-0">
-                <i class="fa-solid fa-bell fa-shake me-1"></i> Suas Notificações de Saques & Lances (TKP)
+                <i class="fa-solid fa-bell fa-shake me-1"></i> Suas Notificações
             </h6>
             <form method="POST" action="{{ url_for('read_notifications') }}">
                 <button type="submit" class="btn btn-sm btn-outline-warning py-0">Marcar como lidas</button>
@@ -1282,7 +1261,6 @@ MAIN_HTML = """
       {% endif %}
     {% endwith %}
 
-    <!-- NAVEGAÇÃO PRINCIPAL POR ABAS -->
     <ul class="nav nav-pills flex-wrap gap-2 mb-4">
         <li class="nav-item">
             <a class="nav-link {% if tab == 'estoque' %}active{% endif %}" href="{{ url_for('dashboard', tab='estoque') }}">
@@ -1310,7 +1288,7 @@ MAIN_HTML = """
         {% if session['role'] == 'admin' %}
         <li class="nav-item">
             <a class="nav-link {% if tab == 'tsconfig' %}active{% endif %}" href="{{ url_for('dashboard', tab='tsconfig') }}">
-                <i class="fa-solid fa-gears me-1"></i> Configurar TeamSpeak 3
+                <i class="fa-solid fa-gears me-1"></i> Configurar TS3
             </a>
         </li>
         {% endif %}
@@ -1321,72 +1299,55 @@ MAIN_HTML = """
         </li>
     </ul>
 
-    <!-- ==========================================================
-         ABA 1: ESTOQUE (LISTA SUSPENSA + ENTRADAS POR DATA DE CHEGADA)
-         ========================================================== -->
     {% if tab == 'estoque' %}
     <div class="row g-4">
-
         {% if session['role'] == 'admin' %}
         <div class="col-lg-4">
-
-            <!-- CARD 1: INCLUIR MAIS NO ESTOQUE VIA LISTA SUSPENSA (DROPDOWN) -->
             <div class="card p-3 mb-4 border-primary">
-                <h6 class="fw-bold text-info mb-1">
-                    <i class="fa-solid fa-list-check me-1"></i> Incluir Mais no Estoque (Lista Suspensa)
-                </h6>
-                <p class="text-secondary small mb-3">
-                    Selecione um item já cadastrado para acumular mais unidades registrando a data de chegada.
-                </p>
+                <h6 class="fw-bold text-info mb-1"><i class="fa-solid fa-list-check me-1"></i> Incluir Mais no Estoque</h6>
+                <p class="text-secondary small mb-3">Selecione o item para acumular saldo e registrar a data de chegada.</p>
                 <form method="POST" action="{{ url_for('add_stock_from_dropdown') }}">
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Selecionar Item Cadastrado</label>
-                        <select name="item_id" id="dropdownItemSelect" class="form-select form-select-sm bg-dark text-light border-secondary" required onchange="syncDropdownTkp(this)">
-                            <option value="" data-tkp="">-- Escolha o item na lista --</option>
+                        <label class="form-label small text-secondary mb-1">Item Cadastrado</label>
+                        <select name="item_id" class="form-select form-select-sm bg-dark text-light border-secondary" required onchange="syncDropdownTkp(this)">
+                            <option value="" data-tkp="">-- Escolha o item --</option>
                             {% for it in catalog_items %}
                             <option value="{{ it.id }}" data-tkp="{{ it.tkp_value }}">
-                                {{ it.item_name }} ({{ it.rarity }} | {{ it.tkp_value }} TKP | Saldo: {{ it.stock_qty }})
+                                {{ it.item_name }} ({{ it.tkp_value }} TKP | Saldo: {{ it.stock_qty }})
                             </option>
                             {% endfor %}
                         </select>
                     </div>
                     <div class="row g-2 mb-2">
                         <div class="col-6">
-                            <label class="form-label small text-secondary mb-1">Qtd que Chegou</label>
+                            <label class="form-label small text-secondary mb-1">Qtd</label>
                             <input type="number" name="quantity" value="1" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                         </div>
                         <div class="col-6">
                             <label class="form-label small text-secondary mb-1">Valor Unit. (TKP)</label>
-                            <input type="number" name="tkp_value" id="dropdownTkpInput" min="0" placeholder="Padrão do item" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary">
+                            <input type="number" name="tkp_value" id="dropdownTkpInput" min="0" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary">
                         </div>
                     </div>
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Data/Hora de Chegada (Opcional)</label>
+                        <label class="form-label small text-secondary mb-1">Data/Hora Chegada (Opcional)</label>
                         <input type="datetime-local" name="arrival_date" class="form-control form-control-sm bg-dark text-light border-secondary">
-                        <div class="form-text text-secondary" style="font-size: 0.7rem;">Deixe em branco para usar a data/hora de agora.</div>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Boss / Origem da Entrada</label>
-                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Boss Kundun / Evento 21h">
+                        <label class="form-label small text-secondary mb-1">Boss / Origem</label>
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Boss Kundun">
                     </div>
                     <button type="submit" class="btn btn-info btn-sm w-100 fw-bold text-dark" {% if not catalog_items %}disabled{% endif %}>
-                        <i class="fa-solid fa-layer-group me-1"></i> Acumular Quantidade no Estoque
+                        Acumular no Estoque
                     </button>
                 </form>
             </div>
 
-            <!-- CARD 2: CADASTRAR NOVO ITEM NO CATÁLOGO + QUANTIDADE INICIAL -->
             <div class="card p-3">
-                <h6 class="fw-bold text-warning mb-1">
-                    <i class="fa-solid fa-plus-circle me-1"></i> Cadastrar Novo Item + Qtd Inicial
-                </h6>
-                <p class="text-secondary small mb-3">
-                    Cadastre um item inédito com seu valor em <strong>TKP</strong>. Ele ficará salvo na lista suspensa acima para futuras entradas.
-                </p>
+                <h6 class="fw-bold text-warning mb-1"><i class="fa-solid fa-plus-circle me-1"></i> Cadastrar Novo Item + Qtd Inicial</h6>
                 <form method="POST" action="{{ url_for('create_new_inventory_item') }}">
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nome do Novo Item (Drop)</label>
-                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Espada Lendária +15" required>
+                        <label class="form-label small text-secondary mb-1">Nome</label>
+                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                     </div>
                     <div class="row g-2 mb-2">
                         <div class="col-4">
@@ -1399,58 +1360,40 @@ MAIN_HTML = """
                             </select>
                         </div>
                         <div class="col-4">
-                            <label class="form-label small text-secondary mb-1">Qtd Inicial</label>
+                            <label class="form-label small text-secondary mb-1">Qtd</label>
                             <input type="number" name="quantity" value="1" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                         </div>
                         <div class="col-4">
-                            <label class="form-label small text-secondary mb-1">Valor (TKP)</label>
+                            <label class="form-label small text-secondary mb-1">TKP</label>
                             <input type="number" name="tkp_value" value="100" min="0" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" required>
                         </div>
                     </div>
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Data/Hora de Chegada (Opcional)</label>
+                        <label class="form-label small text-secondary mb-1">Data/Hora Chegada</label>
                         <input type="datetime-local" name="arrival_date" class="form-control form-control-sm bg-dark text-light border-secondary">
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Boss / Origem</label>
-                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Dragão Vermelho">
+                        <label class="form-label small text-secondary mb-1">Boss</label>
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary">
                     </div>
-                    <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">
-                        <i class="fa-solid fa-box-archive me-1"></i> Cadastrar Item & Gerar 1ª Entrada
-                    </button>
+                    <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">Cadastrar Item</button>
                 </form>
             </div>
-
         </div>
         {% endif %}
 
-        <!-- TABELA DO ESTOQUE POR DATA DE CHEGADA -->
         <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
             <div class="card p-3">
-                <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
-                    <div>
-                        <h6 class="fw-bold mb-0">
-                            <i class="fa-solid fa-calendar-days text-info me-1"></i> Registro do Estoque por Data de Chegada ({{ stock_entries|length }} entradas)
-                        </h6>
-                        <small class="text-secondary">
-                            Histórico detalhado de cada lote que entrou no estoque conforme a data de chegada e quantidade.
-                        </small>
-                    </div>
-                    <a href="{{ url_for('dashboard', tab='saque') }}" class="btn btn-sm btn-outline-warning">
-                        <i class="fa-solid fa-hand-holding-dollar me-1"></i> Ver Consolidado para Saque
-                    </a>
-                </div>
-
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-calendar-days text-info me-1"></i> Histórico de Entradas por Data</h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
                                 <th>Data de Chegada</th>
-                                <th>Item / Raridade</th>
-                                <th>Boss / Origem</th>
-                                <th class="text-center">Qtd na Chegada</th>
-                                <th class="text-center">Valor Unit. (TKP)</th>
-                                <th class="text-center">Total Lote (TKP)</th>
+                                <th>Item</th>
+                                <th>Boss</th>
+                                <th class="text-center">Qtd</th>
+                                <th class="text-center">TKP Unit.</th>
                                 {% if session['role'] == 'admin' %}
                                 <th class="text-end">Estornar</th>
                                 {% endif %}
@@ -1459,79 +1402,47 @@ MAIN_HTML = """
                         <tbody>
                             {% for entry in stock_entries %}
                             <tr>
-                                <td class="small text-info fw-semibold">
-                                    <i class="fa-regular fa-clock me-1"></i>{{ entry.arrival_date }}
-                                </td>
+                                <td class="small text-info fw-semibold">{{ entry.arrival_date }}</td>
                                 <td>
                                     <span class="badge badge-raridade-{{ entry.rarity }} me-1">{{ entry.rarity }}</span>
                                     <strong>{{ entry.item_name }}</strong>
                                 </td>
                                 <td class="small text-secondary">{{ entry.boss_source or '—' }}</td>
-                                <td class="text-center">
-                                    <span class="badge bg-success fs-6">+{{ entry.qty_added }} un.</span>
-                                </td>
-                                <td class="text-center">
-                                    <span class="badge badge-tkp">{{ entry.tkp_value }} TKP</span>
-                                </td>
-                                <td class="text-center fw-bold text-warning">
-                                    {{ entry.qty_added * entry.tkp_value }} TKP
-                                </td>
+                                <td class="text-center"><span class="badge bg-success">+{{ entry.qty_added }}</span></td>
+                                <td class="text-center"><span class="badge badge-tkp">{{ entry.tkp_value }} TKP</span></td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
-                                    <form method="POST" action="{{ url_for('delete_stock_entry', entry_id=entry.id) }}" onsubmit="return confirm('Estornar esta entrada de {{ entry.qty_added }} un. do estoque?');">
-                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2" title="Excluir entrada e descontar do saldo">
-                                            <i class="fa-solid fa-trash"></i>
-                                        </button>
+                                    <form method="POST" action="{{ url_for('delete_stock_entry', entry_id=entry.id) }}" onsubmit="return confirm('Estornar entrada?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="fa-solid fa-trash"></i></button>
                                     </form>
                                 </td>
                                 {% endif %}
                             </tr>
                             {% else %}
-                            <tr>
-                                <td colspan="7" class="text-center text-secondary py-4">
-                                    Nenhuma entrada de estoque registrada ainda. Cadastre o primeiro item ao lado!
-                                </td>
-                            </tr>
+                            <tr><td colspan="6" class="text-center text-secondary py-4">Nenhuma entrada registrada.</td></tr>
                             {% endfor %}
                         </tbody>
                     </table>
                 </div>
             </div>
         </div>
-
     </div>
     {% endif %}
 
-    <!-- ==========================================================
-         ABA 2: DROPS DISPONÍVEIS PARA SAQUE (SOMA DE TODAS AS DATAS + TKP)
-         ========================================================== -->
     {% if tab == 'saque' %}
     <div class="row g-4">
-
-        <!-- COLUNA ESQUERDA: CONSOLIDADO DE TODOS OS DROPS DISPONÍVEIS PARA SAQUE -->
         <div class="col-lg-6">
             <div class="card p-3">
-                <div class="d-flex justify-content-between align-items-center mb-2">
-                    <h6 class="fw-bold text-warning mb-0">
-                        <i class="fa-solid fa-vault me-1"></i> Drops Disponíveis para Saque (Soma Total)
-                    </h6>
-                    <span class="badge bg-dark border border-secondary">
-                        {{ available_drops|length }} tipos disponíveis
-                    </span>
-                </div>
-                <p class="text-secondary small mb-3">
-                    Todos os drops disponíveis no momento <strong>somando todas as datas de entrada</strong>, com seu respectivo valor em <strong>TKP</strong>.
-                </p>
-
+                <h6 class="fw-bold text-warning mb-2"><i class="fa-solid fa-vault me-1"></i> Drops Disponíveis para Saque</h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
-                                <th>Drop / Item</th>
-                                <th class="text-center">Saldo Acumulado</th>
-                                <th class="text-center">Valor em TKP</th>
+                                <th>Item</th>
+                                <th class="text-center">Saldo</th>
+                                <th class="text-center">TKP</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Liberar Saque / Ações</th>
+                                <th class="text-end">Ações</th>
                                 {% endif %}
                             </tr>
                         </thead>
@@ -1541,83 +1452,57 @@ MAIN_HTML = """
                                 <td>
                                     <span class="badge badge-raridade-{{ item.rarity }} me-1">{{ item.rarity }}</span>
                                     <strong>{{ item.item_name }}</strong>
-                                    <div class="text-secondary" style="font-size: 0.72rem;">
-                                        Soma de {{ item.batches_count }} entrada(s) | Última: {{ item.updated_at }}
-                                    </div>
                                 </td>
-                                <td class="text-center">
-                                    <span class="badge bg-success fs-6">{{ item.stock_qty }} un.</span>
-                                </td>
-                                <td class="text-center">
-                                    <span class="badge badge-tkp fs-6">{{ item.tkp_value }} TKP</span>
-                                    <div class="text-secondary" style="font-size: 0.7rem;">
-                                        Total: {{ item.total_tkp_worth }} TKP
-                                    </div>
-                                </td>
+                                <td class="text-center"><span class="badge bg-success">{{ item.stock_qty }} un.</span></td>
+                                <td class="text-center"><span class="badge badge-tkp">{{ item.tkp_value }} TKP</span></td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
                                     <div class="d-flex justify-content-end gap-1">
-                                        <button class="btn btn-sm btn-warning fw-bold text-dark py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#saqueBox{{ item.id }}">
-                                            <i class="fa-solid fa-gavel me-1"></i> Liberar Lance
-                                        </button>
-                                        <button class="btn btn-sm btn-outline-secondary py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#editTkpBox{{ item.id }}" title="Editar TKP">
-                                            <i class="fa-solid fa-pen"></i>
-                                        </button>
+                                        <button class="btn btn-sm btn-warning fw-bold text-dark py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#saqueBox{{ item.id }}">Liberar</button>
+                                        <button class="btn btn-sm btn-outline-secondary py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#editTkpBox{{ item.id }}"><i class="fa-solid fa-pen"></i></button>
                                     </div>
                                 </td>
                                 {% endif %}
                             </tr>
-
                             {% if session['role'] == 'admin' %}
-                            <!-- Painel expansível para liberar o item para saque/lance em TKP -->
                             <tr class="collapse" id="saqueBox{{ item.id }}">
                                 <td colspan="4" class="bg-black p-3 border-warning">
-                                    <div class="small fw-bold text-warning mb-2">
-                                        <i class="fa-solid fa-bolt me-1"></i> Configurar Liberação de Lance para "{{ item.item_name }}"
-                                    </div>
                                     <form method="POST" action="{{ url_for('start_auction') }}" class="row g-2 align-items-end">
                                         <input type="hidden" name="item_id" value="{{ item.id }}">
                                         <div class="col-3">
-                                            <label class="small text-secondary" style="font-size:0.72rem;">Qtd para Saque</label>
+                                            <label class="small text-secondary" style="font-size:0.7rem;">Qtd</label>
                                             <input type="number" name="qty" value="1" min="1" max="{{ item.stock_qty }}" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                                         </div>
                                         <div class="col-4">
-                                            <label class="small text-secondary" style="font-size:0.72rem;">Lance Mínimo (TKP)</label>
+                                            <label class="small text-secondary" style="font-size:0.7rem;">Mínimo TKP</label>
                                             <input type="number" name="min_bid" value="{{ item.tkp_value }}" min="0" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" required>
                                         </div>
                                         <div class="col-3">
-                                            <label class="small text-secondary" style="font-size:0.72rem;">Tempo (Min)</label>
+                                            <label class="small text-secondary" style="font-size:0.7rem;">Minutos</label>
                                             <input type="number" name="duration_minutes" value="15" min="1" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                                         </div>
                                         <div class="col-2">
-                                            <button type="submit" class="btn btn-sm btn-success w-100 fw-bold">Abrir</button>
+                                            <button type="submit" class="btn btn-sm btn-success w-100 fw-bold">OK</button>
                                         </div>
                                     </form>
                                 </td>
                             </tr>
-
-                            <!-- Painel expansível para editar o valor base em TKP do item -->
                             <tr class="collapse" id="editTkpBox{{ item.id }}">
                                 <td colspan="4" class="bg-black p-2 border-secondary">
                                     <div class="d-flex justify-content-between align-items-center">
                                         <form method="POST" action="{{ url_for('update_item_tkp', item_id=item.id) }}" class="d-flex align-items-center gap-2">
-                                            <span class="small text-secondary">Novo Valor em TKP:</span>
-                                            <input type="number" name="tkp_value" value="{{ item.tkp_value }}" min="0" class="form-control form-control-sm bg-dark text-warning border-secondary" style="width: 110px;" required>
-                                            <button type="submit" class="btn btn-sm btn-info">Salvar TKP</button>
+                                            <input type="number" name="tkp_value" value="{{ item.tkp_value }}" min="0" class="form-control form-control-sm bg-dark text-warning border-secondary" style="width: 100px;" required>
+                                            <button type="submit" class="btn btn-sm btn-info">Atualizar TKP</button>
                                         </form>
-                                        <form method="POST" action="{{ url_for('delete_catalog_item', item_id=item.id) }}" onsubmit="return confirm('Excluir este item permanentemente do catálogo?');">
-                                            <button type="submit" class="btn btn-sm btn-outline-danger">Excluir do Catálogo</button>
+                                        <form method="POST" action="{{ url_for('delete_catalog_item', item_id=item.id) }}" onsubmit="return confirm('Excluir item?');">
+                                            <button type="submit" class="btn btn-sm btn-outline-danger">Excluir</button>
                                         </form>
                                     </div>
                                 </td>
                             </tr>
                             {% endif %}
                             {% else %}
-                            <tr>
-                                <td colspan="4" class="text-center text-secondary py-4">
-                                    Nenhum drop com saldo disponível para saque no momento. Adicione unidades na aba <strong>Estoque</strong>!
-                                </td>
-                            </tr>
+                            <tr><td colspan="4" class="text-center text-secondary py-4">Nenhum drop disponível.</td></tr>
                             {% endfor %}
                         </tbody>
                     </table>
@@ -1625,249 +1510,136 @@ MAIN_HTML = """
             </div>
         </div>
 
-        <!-- COLUNA DIREITA: DISPUTAS DE SAQUE ATIVAS (TKP) + FILA DE ENTREGA IN-GAME (OK) -->
         <div class="col-lg-6">
-
-            <!-- 1. LANCES DE SAQUE ABERTOS / DESEMPATE 6 MIN -->
             <div class="card p-3 mb-4">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h6 class="fw-bold mb-0">
-                        <i class="fa-solid fa-fire text-danger me-1"></i> Disputas de Saque Abertas (Lances em TKP)
-                    </h6>
-                    <a href="{{ url_for('dashboard', tab='saque') }}" class="btn btn-sm btn-outline-secondary">
-                        <i class="fa-solid fa-rotate me-1"></i> Atualizar
-                    </a>
-                </div>
-
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-fire text-danger me-1"></i> Disputas de Saque Abertas</h6>
                 {% set active_list = auctions | selectattr('status', 'in', ['Aberto', 'Em Desempate']) | list %}
                 {% if active_list %}
                     {% for a in active_list %}
                     <div class="card p-3 mb-3 bg-dark {% if a.status == 'Em Desempate' %}auction-tie-card{% else %}auction-active-card{% endif %}">
-                        <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
                             <div>
                                 <span class="badge badge-raridade-{{ a.rarity }} me-1">{{ a.rarity }}</span>
-                                <span class="fs-5 fw-bold">{{ a.item_name }}</span>
-                                <span class="badge bg-secondary ms-1">x{{ a.qty }}</span>
+                                <span class="fw-bold">{{ a.item_name }} (x{{ a.qty }})</span>
                                 {% if a.status == 'Em Desempate' %}
-                                    <span class="badge bg-warning text-dark ms-1">
-                                        <i class="fa-solid fa-bolt me-1"></i> DESEMPATE 6 MIN (Rodada {{ a.round_number }})
-                                    </span>
-                                {% else %}
-                                    <span class="badge bg-primary ms-1">Saque Aberto</span>
+                                    <span class="badge bg-warning text-dark ms-1">DESEMPATE 6 MIN</span>
                                 {% endif %}
                             </div>
-
                             <div class="text-end">
-                                <div class="small text-secondary">Tempo Restante:</div>
-                                <div class="timer-box {% if a.status == 'Em Desempate' %}text-warning{% else %}text-info{% endif %}"
-                                     data-seconds="{{ a.seconds_left }}">
-                                    --:--
-                                </div>
+                                <div class="timer-box {% if a.status == 'Em Desempate' %}text-warning{% else %}text-info{% endif %}" data-seconds="{{ a.seconds_left }}">--:--</div>
                             </div>
                         </div>
-
-                        {% if a.status == 'Em Desempate' %}
-                        <div class="alert alert-warning py-2 px-3 small mb-2">
-                            <i class="fa-solid fa-triangle-exclamation me-1"></i>
-                            <strong>Empate em {{ a.min_bid }} TKP!</strong>
-                            Novo lance de <strong>6 minutos</strong> aberto exclusivamente para os empatantes:
-                            <strong>{{ a.tied_names | join(', ') }}</strong>.
-                        </div>
-                        {% endif %}
 
                         <div class="row g-2 align-items-center bg-black bg-opacity-50 rounded p-2 mb-2">
-                            <div class="col-sm-4">
-                                <small class="text-secondary d-block">Valor Base (TKP):</small>
-                                <strong class="text-warning">{{ a.min_bid }} TKP</strong>
-                            </div>
-                            <div class="col-sm-4">
-                                <small class="text-secondary d-block">Maior Lance Atual:</small>
-                                <strong class="text-success fs-5">{{ a.current_highest_bid }} TKP</strong>
-                            </div>
-                            <div class="col-sm-4">
+                            <div class="col-4"><small class="text-secondary">Mínimo:</small><br><strong>{{ a.min_bid }} TKP</strong></div>
+                            <div class="col-4"><small class="text-secondary">Maior Lance:</small><br><strong class="text-success">{{ a.current_highest_bid }} TKP</strong></div>
+                            <div class="col-4">
                                 {% if a.can_user_bid %}
                                 <form method="POST" action="{{ url_for('place_bid', auction_id=a.id) }}" class="d-flex gap-1">
-                                    <input type="number" name="bid_amount"
-                                           min="{% if a.status == 'Em Desempate' %}{{ a.min_bid + 1 }}{% else %}{{ a.min_bid }}{% endif %}"
-                                           placeholder="TKP"
-                                           class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                                    <button type="submit" class="btn btn-sm btn-success fw-bold text-nowrap">
-                                        Dar Lance
-                                    </button>
+                                    <input type="number" name="bid_amount" min="{% if a.status == 'Em Desempate' %}{{ a.min_bid + 1 }}{% else %}{{ a.min_bid }}{% endif %}" placeholder="TKP" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                                    <button type="submit" class="btn btn-sm btn-success fw-bold">Dar</button>
                                 </form>
                                 {% else %}
-                                <span class="badge bg-secondary w-100 py-2">
-                                    <i class="fa-solid fa-lock me-1"></i> Só Empatantes
-                                </span>
+                                <span class="badge bg-secondary w-100 py-2">Bloqueado</span>
                                 {% endif %}
                             </div>
                         </div>
 
-                        <div class="d-flex flex-wrap justify-content-between align-items-center mt-1">
-                            <div class="small text-secondary">
-                                <strong>Lances ({{ a.bids_list|length }}):</strong>
-                                {% for b in a.bids_list %}
-                                    <span class="badge bg-secondary bg-opacity-50 text-light me-1">
-                                        {{ b.username }}: <strong class="text-warning">{{ b.bid_amount }} TKP</strong> ({{ b.bid_time }})
-                                    </span>
-                                {% else %}
-                                    <span>Nenhum lance registrado ainda.</span>
-                                {% endfor %}
-                            </div>
-
+                        <div class="d-flex justify-content-between align-items-center small text-secondary">
+                            <div>Lances: {{ a.bids_list|length }}</div>
                             {% if session['role'] == 'admin' %}
-                            <div class="d-flex gap-1 mt-2 mt-sm-0">
-                                <form method="POST" action="{{ url_for('force_end_auction', auction_id=a.id) }}">
-                                    <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Encerrar tempo e apurar agora">
-                                        <i class="fa-solid fa-flag-checkered me-1"></i> Encerrar Agora
-                                    </button>
-                                </form>
-                                <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Cancelar e devolver o item ao saldo disponível?');">
-                                    <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
-                                        <i class="fa-solid fa-xmark"></i>
-                                    </button>
-                                </form>
+                            <div class="d-flex gap-1">
+                                <form method="POST" action="{{ url_for('force_end_auction', auction_id=a.id) }}"><button type="submit" class="btn btn-sm btn-outline-warning py-0">Encerrar</button></form>
+                                <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}"><button type="submit" class="btn btn-sm btn-outline-danger py-0"><i class="fa-solid fa-xmark"></i></button></form>
                             </div>
                             {% endif %}
                         </div>
                     </div>
                     {% endfor %}
                 {% else %}
-                    <p class="text-secondary small text-center py-3 mb-0">
-                        Nenhuma disputa de saque aberta agora. O Admin pode liberar qualquer item disponível ao lado!
-                    </p>
+                    <p class="text-secondary small text-center py-3 mb-0">Nenhuma disputa aberta.</p>
                 {% endif %}
             </div>
 
-            <!-- 2. VENCEDORES & ENTREGA IN-GAME (OK DO ADMIN) -->
             <div class="card p-3">
-                <h6 class="fw-bold mb-3">
-                    <i class="fa-solid fa-handshake-simple text-success me-1"></i> Saques Vencidos & Entrega In-Game (OK)
-                </h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-handshake-simple text-success me-1"></i> Saques Vencidos & Entregas</h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
                                 <th>Item</th>
                                 <th>Vencedor</th>
-                                <th>Lance Final</th>
+                                <th>Lance</th>
                                 <th>Status</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Confirmar</th>
+                                <th class="text-end">Ação</th>
                                 {% endif %}
                             </tr>
                         </thead>
                         <tbody>
                             {% for a in auctions if a.status not in ['Aberto', 'Em Desempate'] %}
                             <tr>
+                                <td><strong>{{ a.item_name }}</strong></td>
+                                <td><span class="text-warning">{{ a.winner_name or '—' }}</span></td>
+                                <td><span class="badge badge-tkp">{{ a.winning_bid or 0 }} TKP</span></td>
                                 <td>
-                                    <span class="badge badge-raridade-{{ a.rarity }} me-1">{{ a.rarity }}</span>
-                                    <strong>{{ a.item_name }}</strong>
-                                    <span class="badge bg-secondary ms-1">x{{ a.qty }}</span>
-                                </td>
-                                <td>
-                                    {% if a.winner_name %}
-                                        <strong class="text-warning"><i class="fa-solid fa-crown me-1"></i>{{ a.winner_name }}</strong>
-                                        <small class="text-secondary d-block">TS3: {{ a.winner_nick }}</small>
-                                    {% else %}
-                                        <span class="text-secondary small">—</span>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    {% if a.winning_bid %}
-                                        <span class="badge badge-tkp">{{ a.winning_bid }} TKP</span>
-                                    {% else %}
-                                        —
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    {% if a.status == 'Aguardando Entrega' %}
-                                        <span class="badge bg-warning text-dark">Aguardando Entrega</span>
-                                    {% elif a.status == 'Entregue (OK)' %}
-                                        <span class="badge bg-success">OK ({{ a.delivered_at }})</span>
-                                    {% else %}
-                                        <span class="badge bg-secondary">{{ a.status }}</span>
-                                    {% endif %}
+                                    {% if a.status == 'Aguardando Entrega' %}<span class="badge bg-warning text-dark">Aguardando</span>
+                                    {% elif a.status == 'Entregue (OK)' %}<span class="badge bg-success">OK</span>
+                                    {% else %}<span class="badge bg-secondary">{{ a.status }}</span>{% endif %}
                                 </td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
-                                    <div class="d-flex justify-content-end gap-1">
-                                        {% if a.status == 'Aguardando Entrega' %}
-                                        <form method="POST" action="{{ url_for('confirm_delivery', auction_id=a.id) }}">
-                                            <button type="submit" class="btn btn-sm btn-success fw-bold py-0 px-2">
-                                                <i class="fa-solid fa-check me-1"></i> OK
-                                            </button>
-                                        </form>
-                                        {% endif %}
-                                        <form method="POST" action="{{ url_for('delete_auction', auction_id=a.id) }}" onsubmit="return confirm('Remover registro?');">
-                                            <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
-                                                <i class="fa-solid fa-trash"></i>
-                                            </button>
-                                        </form>
-                                    </div>
+                                    {% if a.status == 'Aguardando Entrega' %}
+                                    <form method="POST" action="{{ url_for('confirm_delivery', auction_id=a.id) }}">
+                                        <button type="submit" class="btn btn-sm btn-success fw-bold py-0 px-2">OK</button>
+                                    </form>
+                                    {% endif %}
                                 </td>
                                 {% endif %}
                             </tr>
                             {% else %}
-                            <tr>
-                                <td colspan="5" class="text-center text-secondary py-3">Nenhum saque finalizado ainda.</td>
-                            </tr>
+                            <tr><td colspan="5" class="text-center text-secondary py-3">Nenhum histórico.</td></tr>
                             {% endfor %}
                         </tbody>
                     </table>
                 </div>
             </div>
-
         </div>
     </div>
     {% endif %}
 
-    <!-- ==========================================================
-         ABA 3: EVENTOS & CHAMADA TS3
-         ========================================================== -->
     {% if tab == 'eventos' %}
     <div class="row g-4">
         <div class="col-lg-4">
             {% if session['role'] == 'admin' %}
             <div class="card p-3 mb-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-plus-circle text-primary me-1"></i> Iniciar Novo Evento</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-plus-circle text-primary me-1"></i> Criar Evento</h6>
                 <form method="POST" action="{{ url_for('create_event') }}">
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nome do Evento / Boss</label>
-                        <input type="text" name="title" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Castle Siege 21h / Boss Raid" required>
+                        <label class="form-label small text-secondary">Título</label>
+                        <input type="text" name="title" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Tipo</label>
+                        <label class="form-label small text-secondary">Tipo</label>
                         <select name="event_type" class="form-select form-select-sm bg-dark text-light border-secondary">
                             <option value="Guerra / PvP">Guerra / PvP</option>
                             <option value="Boss / Raid">Boss / Raid</option>
-                            <option value="Evento Diário">Evento Diário</option>
-                            <option value="Reunião TS3">Reunião TS3</option>
                         </select>
                     </div>
-                    <button type="submit" class="btn btn-primary btn-sm w-100 fw-semibold">
-                        <i class="fa-solid fa-play me-1"></i> Criar Evento
-                    </button>
+                    <button type="submit" class="btn btn-primary btn-sm w-100">Criar</button>
                 </form>
             </div>
             {% endif %}
 
             <div class="card p-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-calendar-check text-info me-1"></i> Histórico de Eventos ({{ total_events }})</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-calendar-check text-info me-1"></i> Eventos ({{ total_events }})</h6>
                 <div class="list-group list-group-flush">
                     {% for ev in events %}
-                    <a href="{{ url_for('dashboard', tab='eventos', event_id=ev.id) }}"
-                       class="list-group-item list-group-item-action bg-transparent text-light border-secondary py-2 {% if selected_event and selected_event.id == ev.id %}active rounded{% endif %}">
-                        <div class="d-flex justify-content-between align-items-center">
-                            <strong class="small">{{ ev.title }}</strong>
-                            <span class="badge bg-dark border border-secondary">{{ ev.event_type }}</span>
-                        </div>
-                        <div class="small text-secondary mt-1" style="font-size: 0.75rem;">
-                            <i class="fa-regular fa-clock me-1"></i> {{ ev.created_at }}
-                        </div>
+                    <a href="{{ url_for('dashboard', tab='eventos', event_id=ev.id) }}" class="list-group-item list-group-item-action bg-transparent text-light border-secondary py-2 {% if selected_event and selected_event.id == ev.id %}active rounded{% endif %}">
+                        <strong class="small">{{ ev.title }}</strong><br><small class="text-secondary">{{ ev.created_at }}</small>
                     </a>
                     {% else %}
-                    <p class="text-secondary small mb-0">Nenhum evento registrado ainda.</p>
+                    <p class="text-secondary small mb-0">Nenhum evento.</p>
                     {% endfor %}
                 </div>
             </div>
@@ -1876,56 +1648,28 @@ MAIN_HTML = """
         <div class="col-lg-8">
             {% if selected_event %}
             <div class="card p-4">
-                <div class="d-flex flex-wrap justify-content-between align-items-center border-bottom border-secondary pb-3 mb-3 gap-2">
+                <div class="d-flex justify-content-between align-items-center border-bottom border-secondary pb-3 mb-3">
                     <div>
-                        <span class="badge bg-primary mb-1">{{ selected_event.event_type }}</span>
                         <h4 class="fw-bold mb-0">{{ selected_event.title }}</h4>
-                        <small class="text-secondary">
-                            Criado em {{ selected_event.created_at }} | Última leitura TS3: <strong>{{ selected_event.last_sync }}</strong>
-                        </small>
+                        <small class="text-secondary">Dá +1 TKP para cada player presente na chamada.</small>
                     </div>
-
                     {% if session['role'] == 'admin' %}
                     <div class="d-flex gap-2">
-                        <form method="POST" action="{{ url_for('sync_event_ts3', event_id=selected_event.id) }}">
-                            <button type="submit" class="btn btn-success fw-semibold">
-                                <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Presença do TS3 Agora
-                            </button>
-                        </form>
-                        <form method="POST" action="{{ url_for('delete_event', event_id=selected_event.id) }}" onsubmit="return confirm('Excluir este evento e todas as presenças dele?');">
-                            <button type="submit" class="btn btn-outline-danger">
-                                <i class="fa-solid fa-trash"></i>
-                            </button>
-                        </form>
+                        <form method="POST" action="{{ url_for('sync_event_ts3', event_id=selected_event.id) }}"><button type="submit" class="btn btn-success fw-semibold"><i class="fa-solid fa-satellite-dish me-1"></i> Puxar Presença TS3</button></form>
+                        <form method="POST" action="{{ url_for('delete_event', event_id=selected_event.id) }}"><button type="submit" class="btn btn-outline-danger"><i class="fa-solid fa-trash"></i></button></form>
                     </div>
                     {% endif %}
                 </div>
-
-                {% if session['role'] == 'admin' %}
-                <div class="mb-3">
-                    <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#collapsePaste">
-                        <i class="fa-solid fa-paste me-1"></i> Contingência: Colar lista de Nicks do TS3 manualmente
-                    </button>
-                    <div class="collapse mt-2" id="collapsePaste">
-                        <form method="POST" action="{{ url_for('manual_paste_ts3', event_id=selected_event.id) }}" class="card card-body bg-dark border-secondary p-2">
-                            <small class="text-secondary mb-1">Se o host do seu TS3 estiver bloqueando conexão externa, cole aqui os nicks copiados da sala:</small>
-                            <textarea name="raw_nicks" rows="2" class="form-control form-control-sm bg-black text-light border-secondary mb-2"></textarea>
-                            <button type="submit" class="btn btn-sm btn-info align-self-end">Processar Nicks Colados</button>
-                        </form>
-                    </div>
-                </div>
-                {% endif %}
 
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
-                                <th>Login Player</th>
-                                <th>Nick Cadastrado (TS3)</th>
-                                <th>Status no Evento</th>
-                                <th>Nick Lido / Método</th>
+                                <th>Login</th>
+                                <th>Nick TS3</th>
+                                <th>Status</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Ação Manual</th>
+                                <th class="text-end">Ação</th>
                                 {% endif %}
                             </tr>
                         </thead>
@@ -1936,27 +1680,14 @@ MAIN_HTML = """
                                 <td class="fw-semibold">{{ u.username }}</td>
                                 <td><span class="badge bg-secondary">{{ u.ts_nick }}</span></td>
                                 <td>
-                                    {% if att %}
-                                        <span class="badge bg-success"><i class="fa-solid fa-check me-1"></i> PRESENTE</span>
-                                    {% else %}
-                                        <span class="badge bg-danger bg-opacity-50 text-light"><i class="fa-solid fa-xmark me-1"></i> AUSENTE</span>
-                                    {% endif %}
-                                </td>
-                                <td class="small text-secondary">
-                                    {% if att %}
-                                        <strong class="text-light">{{ att.ts_nick_found }}</strong> ({{ att.method }} às {{ att.checked_at }})
-                                    {% else %}
-                                        —
-                                    {% endif %}
+                                    {% if att %}<span class="badge bg-success">PRESENTE (+1 TKP)</span>
+                                    {% else %}<span class="badge bg-danger bg-opacity-50 text-light">AUSENTE</span>{% endif %}
                                 </td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
-                                    <form method="POST" action="{{ url_for('toggle_attendance', event_id=selected_event.id, user_id=u.id) }}" class="d-inline">
-                                        {% if att %}
-                                            <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2">Remover</button>
-                                        {% else %}
-                                            <button type="submit" class="btn btn-sm btn-outline-success py-0 px-2">+ Presença</button>
-                                        {% endif %}
+                                    <form method="POST" action="{{ url_for('toggle_attendance', event_id=selected_event.id, user_id=u.id) }}">
+                                        {% if att %}<button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2">Remover</button>
+                                        {% else %}<button type="submit" class="btn btn-sm btn-outline-success py-0 px-2">+ Presença</button>{% endif %}
                                     </form>
                                 </td>
                                 {% endif %}
@@ -1967,48 +1698,27 @@ MAIN_HTML = """
                 </div>
             </div>
             {% else %}
-            <div class="card p-5 text-center">
-                <i class="fa-solid fa-tower-broadcast fa-3x text-secondary mb-3"></i>
-                <h5>Nenhum Evento Selecionado</h5>
-                <p class="text-secondary small">Crie um evento ao lado para puxar a lista de presença do TeamSpeak 3.</p>
-            </div>
+            <div class="card p-5 text-center"><h5>Selecione um evento</h5></div>
             {% endif %}
         </div>
     </div>
     {% endif %}
 
-    <!-- ==========================================================
-         ABA 4: PLAYERS & RANKING
-         ========================================================== -->
     {% if tab == 'players' %}
     <div class="row g-4">
         {% if session['role'] == 'admin' %}
         <div class="col-lg-4">
             <div class="card p-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-success me-1"></i> Cadastrar Novo Player / Admin</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-success me-1"></i> Novo Player</h6>
                 <form method="POST" action="{{ url_for('create_user') }}">
-                    <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Login de Acesso ao Site</label>
-                        <input type="text" name="username" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                    </div>
-                    <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Senha do Player</label>
-                        <input type="text" name="password" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                    </div>
-                    <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nick Exato no TeamSpeak 3</label>
-                        <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" required>
-                    </div>
+                    <div class="mb-2"><label class="form-label small text-secondary">Login</label><input type="text" name="username" class="form-control form-control-sm bg-dark text-light border-secondary" required></div>
+                    <div class="mb-2"><label class="form-label small text-secondary">Senha</label><input type="text" name="password" class="form-control form-control-sm bg-dark text-light border-secondary" required></div>
+                    <div class="mb-2"><label class="form-label small text-secondary">Nick TS3</label><input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" required></div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Permissão no Site</label>
-                        <select name="role" class="form-select form-select-sm bg-dark text-light border-secondary">
-                            <option value="player" selected>Player</option>
-                            <option value="admin">Administrador</option>
-                        </select>
+                        <label class="form-label small text-secondary">Cargo</label>
+                        <select name="role" class="form-select form-select-sm bg-dark text-light border-secondary"><option value="player" selected>Player</option><option value="admin">Admin</option></select>
                     </div>
-                    <button type="submit" class="btn btn-success btn-sm w-100 fw-semibold">
-                        <i class="fa-solid fa-check me-1"></i> Criar Conta do Player
-                    </button>
+                    <button type="submit" class="btn btn-success btn-sm w-100">Criar</button>
                 </form>
             </div>
         </div>
@@ -2016,16 +1726,16 @@ MAIN_HTML = """
 
         <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
             <div class="card p-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-trophy text-warning me-1"></i> Membros Cadastrados & Taxa de Presença TS3</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-trophy text-warning me-1"></i> Membros & Saldo TKP</h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
                             <tr>
-                                <th>Login Site</th>
-                                <th>Nick no TS3</th>
-                                <th>Cargo</th>
-                                <th>Presenças ({{ total_events }} Eventos)</th>
-                                <th>Drops Sacados</th>
+                                <th>Login</th>
+                                <th>Nick TS3</th>
+                                <th>Saldo TKP</th>
+                                <th>Presenças</th>
+                                <th>Itens Sacados</th>
                                 {% if session['role'] == 'admin' %}
                                 <th class="text-end">Excluir</th>
                                 {% endif %}
@@ -2036,31 +1746,14 @@ MAIN_HTML = """
                             <tr>
                                 <td class="fw-bold">{{ u.username }}</td>
                                 <td><span class="badge bg-secondary">{{ u.ts_nick }}</span></td>
-                                <td>
-                                    {% if u.role == 'admin' %}
-                                        <span class="badge bg-primary">Admin</span>
-                                    {% else %}
-                                        <span class="badge bg-dark border border-secondary">Player</span>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    <div class="d-flex align-items-center gap-2">
-                                        <div class="progress flex-grow-1 bg-dark" style="height: 8px; max-width: 110px;">
-                                            <div class="progress-bar bg-success" style="width: {{ u.pct }}%;"></div>
-                                        </div>
-                                        <span class="small fw-semibold">{{ u.presences }} ({{ u.pct }}%)</span>
-                                    </div>
-                                </td>
-                                <td>
-                                    <span class="badge bg-warning text-dark fw-bold">{{ u.drops_won }} itens</span>
-                                </td>
+                                <td><span class="badge badge-tkp fs-6"><i class="fa-solid fa-coins me-1"></i>{{ u.tkp_balance }} TKP</span></td>
+                                <td><span class="small">{{ u.presences }} ({{ u.pct }}%)</span></td>
+                                <td><span class="badge bg-warning text-dark">{{ u.drops_won }} itens</span></td>
                                 {% if session['role'] == 'admin' %}
                                 <td class="text-end">
                                     {% if u.id != session['user_id'] %}
-                                    <form method="POST" action="{{ url_for('delete_user', user_id=u.id) }}" onsubmit="return confirm('Excluir o jogador {{ u.username }}?');">
-                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
-                                            <i class="fa-solid fa-user-xmark"></i>
-                                        </button>
+                                    <form method="POST" action="{{ url_for('delete_user', user_id=u.id) }}" onsubmit="return confirm('Excluir?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="fa-solid fa-user-xmark"></i></button>
                                     </form>
                                     {% endif %}
                                 </td>
@@ -2075,57 +1768,25 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================================
-         ABA 5: CONFIGURAR TS3
-         ========================================================== -->
     {% if tab == 'tsconfig' and session['role'] == 'admin' %}
     <div class="row justify-content-center">
         <div class="col-lg-7">
             <div class="card p-4">
-                <h5 class="fw-bold mb-1"><i class="fa-solid fa-server text-primary me-2"></i> Credenciais do Servidor TeamSpeak 3 (ServerQuery)</h5>
-                <p class="text-secondary small mb-4">
-                    Preencha os dados do seu servidor TS3 para puxar os nicks presentes nas salas em tempo real.
-                </p>
-
-                <form method="POST" action="{{ url_for('save_tsconfig') }}">
+                <h5 class="fw-bold mb-3"><i class="fa-solid fa-server text-primary me-2"></i> Configurar TS3</h5>
+                <form method="POST" action="{{ url_for('tsconfig/save' if False else url_for('save_tsconfig')) }}">
                     <div class="row g-3 mb-3">
-                        <div class="col-md-6">
-                            <label class="form-label small text-secondary">Endereço IP ou Domínio do TS3</label>
-                            <input type="text" name="host" value="{{ ts_cfg.host }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small text-secondary">Porta de Voz (UDP)</label>
-                            <input type="number" name="voice_port" value="{{ ts_cfg.voice_port }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small text-secondary">Porta ServerQuery (TCP)</label>
-                            <input type="number" name="query_port" value="{{ ts_cfg.query_port }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
+                        <div class="col-md-6"><label class="form-label small text-secondary">Host / IP</label><input type="text" name="host" value="{{ ts_cfg.host }}" class="form-control bg-dark text-light border-secondary" required></div>
+                        <div class="col-md-3"><label class="form-label small text-secondary">Porta Voz</label><input type="number" name="voice_port" value="{{ ts_cfg.voice_port }}" class="form-control bg-dark text-light border-secondary" required></div>
+                        <div class="col-md-3"><label class="form-label small text-secondary">Porta Query</label><input type="number" name="query_port" value="{{ ts_cfg.query_port }}" class="form-control bg-dark text-light border-secondary" required></div>
                     </div>
-
                     <div class="row g-3 mb-3">
-                        <div class="col-md-6">
-                            <label class="form-label small text-secondary">Usuário ServerQuery</label>
-                            <input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary">
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label small text-secondary">Senha ServerQuery</label>
-                            <input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary">
-                        </div>
+                        <div class="col-md-6"><label class="form-label small text-secondary">Usuário Query</label><input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary"></div>
+                        <div class="col-md-6"><label class="form-label small text-secondary">Senha Query</label><input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary"></div>
                     </div>
-
-                    <div class="mb-4">
-                        <label class="form-label small text-secondary">Ignorar Salas com estes Nomes (separados por vírgula)</label>
-                        <input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary">
-                    </div>
-
+                    <div class="mb-4"><label class="form-label small text-secondary">Salas AFK</label><input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary"></div>
                     <div class="d-flex gap-2">
-                        <button type="submit" name="action" value="save" class="btn btn-primary fw-semibold">
-                            <i class="fa-solid fa-floppy-disk me-1"></i> Salvar Configurações
-                        </button>
-                        <button type="submit" name="action" value="test" class="btn btn-outline-info fw-semibold">
-                            <i class="fa-solid fa-plug-circle-check me-1"></i> Salvar e Testar Conexão Agora
-                        </button>
+                        <button type="submit" name="action" value="save" class="btn btn-primary">Salvar</button>
+                        <button type="submit" name="action" value="test" class="btn btn-outline-info">Salvar e Testar</button>
                     </div>
                 </form>
             </div>
@@ -2133,30 +1794,16 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- ==========================================================
-         ABA 6: MEU PERFIL
-         ========================================================== -->
     {% if tab == 'perfil' %}
     <div class="row justify-content-center">
         <div class="col-lg-5">
             <div class="card p-4">
-                <h5 class="fw-bold mb-3"><i class="fa-solid fa-user-gear text-info me-2"></i> Meus Dados de Jogador</h5>
+                <h5 class="fw-bold mb-3"><i class="fa-solid fa-user-gear text-info me-2"></i> Meu Perfil</h5>
                 <form method="POST" action="{{ url_for('update_profile') }}">
-                    <div class="mb-3">
-                        <label class="form-label small text-secondary">Login</label>
-                        <input type="text" value="{{ session['username'] }}" class="form-control bg-dark text-secondary border-secondary" disabled>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label small text-secondary">Meu Nick no TeamSpeak 3</label>
-                        <input type="text" name="ts_nick" value="{{ session['ts_nick'] }}" class="form-control bg-dark text-light border-secondary" required>
-                    </div>
-                    <div class="mb-4">
-                        <label class="form-label small text-secondary">Nova Senha (deixe em branco para manter a atual)</label>
-                        <input type="password" name="new_password" class="form-control bg-dark text-light border-secondary">
-                    </div>
-                    <button type="submit" class="btn btn-primary w-100 fw-semibold">
-                        <i class="fa-solid fa-save me-1"></i> Atualizar Meu Perfil
-                    </button>
+                    <div class="mb-3"><label class="form-label small text-secondary">Login</label><input type="text" value="{{ session['username'] }}" class="form-control bg-dark text-secondary border-secondary" disabled></div>
+                    <div class="mb-3"><label class="form-label small text-secondary">Nick TS3</label><input type="text" name="ts_nick" value="{{ session['ts_nick'] }}" class="form-control bg-dark text-light border-secondary" required></div>
+                    <div class="mb-4"><label class="form-label small text-secondary">Nova Senha</label><input type="password" name="new_password" class="form-control bg-dark text-light border-secondary"></div>
+                    <button type="submit" class="btn btn-primary w-100">Atualizar</button>
                 </form>
             </div>
         </div>
@@ -2167,30 +1814,23 @@ MAIN_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // Preenche automaticamente o valor em TKP quando o Admin seleciona um item na lista suspensa
     function syncDropdownTkp(selectEl) {
         const opt = selectEl.options[selectEl.selectedIndex];
         const tkp = opt ? opt.getAttribute('data-tkp') : '';
         const input = document.getElementById('dropdownTkpInput');
-        if (input && tkp) {
-            input.value = tkp;
-        }
+        if (input && tkp) { input.value = tkp; }
     }
 
-    // Cronômetro regressivo em tempo real para os saques/lances abertos e desempates de 6 min
     function initTimers() {
         const timers = document.querySelectorAll('.timer-box');
         if (!timers.length) return;
-
         setInterval(() => {
             let shouldReload = false;
             timers.forEach(el => {
                 let sec = parseInt(el.getAttribute('data-seconds'), 10);
                 if (isNaN(sec)) return;
-                if (sec <= 0) {
-                    el.textContent = "00:00";
-                    shouldReload = true;
-                } else {
+                if (sec <= 0) { el.textContent = "00:00"; shouldReload = true; }
+                else {
                     sec -= 1;
                     el.setAttribute('data-seconds', sec);
                     const m = String(Math.floor(sec / 60)).padStart(2, '0');
@@ -2198,9 +1838,7 @@ MAIN_HTML = """
                     el.textContent = m + ":" + s;
                 }
             });
-            if (shouldReload) {
-                window.location.reload();
-            }
+            if (shouldReload) { window.location.reload(); }
         }, 1000);
     }
     document.addEventListener('DOMContentLoaded', initTimers);
