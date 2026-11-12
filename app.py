@@ -10,7 +10,7 @@ import http.cookiejar
 from urllib.parse import urlparse
 from datetime import datetime
 from functools import wraps
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
@@ -97,7 +97,7 @@ def safe_add_column(table_name, column_def):
 def init_db():
     id_col = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-    # 1. Usuários (inclui bonus_tkp para ajustes manuais do Admin)
+    # 1. Usuários (inclui bonus_tkp, account_status para aprovação e reset_status para troca de senha)
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS users (
             id {id_col},
@@ -106,10 +106,18 @@ def init_db():
             ts_nick VARCHAR(120) NOT NULL,
             role VARCHAR(20) DEFAULT 'player',
             bonus_tkp INTEGER DEFAULT 0,
+            account_status VARCHAR(30) DEFAULT 'ativo',
+            reset_status VARCHAR(30) DEFAULT 'nenhum',
             created_at VARCHAR(40)
         )
     """)
     safe_add_column("users", "bonus_tkp INTEGER DEFAULT 0")
+    safe_add_column("users", "account_status VARCHAR(30) DEFAULT 'ativo'")
+    safe_add_column("users", "reset_status VARCHAR(30) DEFAULT 'nenhum'")
+
+    # Garante que contas antigas fiquem ativas
+    db_execute("UPDATE users SET account_status = 'ativo' WHERE account_status IS NULL OR account_status = ''")
+    db_execute("UPDATE users SET reset_status = 'nenhum' WHERE reset_status IS NULL OR reset_status = ''")
 
     # 2. Configuração TS3 + Integração API NEO TEAMSPEAK
     db_execute("""
@@ -225,7 +233,6 @@ def init_db():
         )
     """)
 
-    # Backfill de entradas de estoque
     existing_items = db_execute("SELECT * FROM inventory_items", fetch=True)
     for it in existing_items:
         has_entry = db_execute("SELECT id FROM inventory_entries WHERE item_id = ?", (it["id"],), fetchone=True)
@@ -255,8 +262,8 @@ def init_db():
     admin = db_execute("SELECT id FROM users WHERE username = ?", ("admin",), fetchone=True)
     if not admin:
         db_execute("""
-            INSERT INTO users (username, password_hash, ts_nick, role, bonus_tkp, created_at)
-            VALUES (?, ?, ?, ?, 0, ?)
+            INSERT INTO users (username, password_hash, ts_nick, role, bonus_tkp, account_status, reset_status, created_at)
+            VALUES (?, ?, ?, ?, 0, 'ativo', 'nenhum', ?)
         """, (
             "admin",
             generate_password_hash("admin123"),
@@ -428,7 +435,6 @@ def resolve_expired_auctions(force_auction_id=None):
 # INTEGRAÇÃO API NEO TEAMSPEAK (JSON) + ÁRVORE DE CANAIS (GVG / TW / AFK)
 # ==========================================
 def clean_channel_label(name):
-    """Remove tags visuais como [cspacer1] ou bullets para exibir o nome limpo da sala."""
     if not name:
         return ""
     cleaned = re.sub(r"\[[^\]]*spacer[^\]]*\]", "", str(name), flags=re.IGNORECASE)
@@ -436,11 +442,6 @@ def clean_channel_label(name):
     return cleaned or str(name).strip()
 
 def build_channel_hierarchy(channels_list):
-    """
-    Constrói um dicionário {cid: {"name": ..., "full_path": ...}} subindo pelos 'pid'.
-    Exemplo: cid="70" ('• PT 01 - CATAPULTA') -> pid="69" ('• Ataque') -> pid="68" ('[cspacer1]TW')
-    Resultado full_path: 'TW > Ataque > PT 01 - CATAPULTA'
-    """
     by_cid = {}
     for ch in channels_list:
         cid = str(ch.get("cid") or ch.get("channel_id") or "")
@@ -474,11 +475,6 @@ def build_channel_hierarchy(channels_list):
     return hierarchy
 
 def parse_neots_json_payload(data, ignore_keywords, filter_mode="all"):
-    """
-    Processa o JSON da NeoTS (chaves 'channels' e 'clients') e aplica:
-    - Ignorar salas AFK/Ausente
-    - Filtro de modalidade ('all', 'gvg_tw', 'gvg', 'tw', 'eventos')
-    """
     if not isinstance(data, dict) or "clients" not in data:
         return False, "Formato JSON inesperado retornado pela API (chave 'clients' ausente)."
 
@@ -501,12 +497,10 @@ def parse_neots_json_payload(data, ignore_keywords, filter_mode="all"):
         full_path = ch_info["full_path"]
         path_lower = full_path.lower()
 
-        # 1. Verifica se está em sala de AFK / Ausente
         if ignore_keywords and any(kw in path_lower for kw in ignore_keywords):
             skipped_afk.append(f"{nick} ({full_path})")
             continue
 
-        # 2. Aplica o filtro de canal selecionado pelo Admin (GVG, TW, Eventos ou Todas)
         if filter_mode == "gvg_tw":
             if not ("gvg" in path_lower or "tw" in path_lower):
                 skipped_filter.append(f"{nick} ({full_path})")
@@ -538,9 +532,6 @@ def parse_neots_json_payload(data, ignore_keywords, filter_mode="all"):
     }
 
 def fetch_neots_api_clients(cfg, filter_mode="all"):
-    """
-    Conecta na URL da API da NEO TEAMSPEAK (com suporte a Cookie ou Login automático no WordPress da NeoTS).
-    """
     api_url = (cfg.get("neots_api_url") or DEFAULT_NEOTS_API_URL).strip()
     neots_user = (cfg.get("query_user") or "").strip()
     neots_pass = (cfg.get("query_pass") or "").strip()
@@ -554,12 +545,17 @@ def fetch_neots_api_clients(cfg, filter_mode="all"):
         "Referer": "https://neots.com.br/"
     }
     if neots_cookie:
-        headers["Cookie"] = neots_cookie
+        # Suporta caso o usuário tenha colado Cookie + X-WP-Nonce juntos ou apenas o Cookie
+        if "||NONCE:" in neots_cookie:
+            cookie_part, nonce_part = neots_cookie.split("||NONCE:", 1)
+            headers["Cookie"] = cookie_part.strip()
+            headers["X-WP-Nonce"] = nonce_part.strip()
+        else:
+            headers["Cookie"] = neots_cookie
 
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
-    # 1ª Tentativa: Requisição direta na URL da API (com ou sem Cookie configurado)
     try:
         req = urllib.request.Request(api_url, headers=headers, method="GET")
         with opener.open(req, timeout=10) as resp:
@@ -568,7 +564,6 @@ def fetch_neots_api_clients(cfg, filter_mode="all"):
             if isinstance(data, dict) and "clients" in data:
                 return parse_neots_json_payload(data, ignore_keywords, filter_mode=filter_mode)
     except urllib.error.HTTPError as http_err:
-        # Se retornou 401/403 e o Admin preencheu login/senha do painel NeoTS, tenta autenticar no WordPress
         if http_err.code in (401, 403) and neots_user and neots_pass:
             try:
                 login_url = "https://neots.com.br/wp-login.php"
@@ -584,34 +579,25 @@ def fetch_neots_api_clients(cfg, filter_mode="all"):
                 login_req = urllib.request.Request(login_url, data=login_data, headers=login_headers, method="POST")
                 with opener.open(login_req, timeout=10) as login_resp:
                     panel_html = login_resp.read().decode("utf-8", errors="ignore")
-                    # Captura X-WP-Nonce caso esteja presente no HTML do painel
                     nonce_match = re.search(r'"nonce"\s*:\s*"([a-zA-Z0-9]+)"', panel_html)
                     if nonce_match:
                         headers["X-WP-Nonce"] = nonce_match.group(1)
 
-                # Repete a chamada na API agora autenticado
                 req2 = urllib.request.Request(api_url, headers=headers, method="GET")
                 with opener.open(req2, timeout=10) as resp2:
                     raw_body2 = resp2.read().decode("utf-8", errors="ignore")
                     data2 = json.loads(raw_body2)
                     return parse_neots_json_payload(data2, ignore_keywords, filter_mode=filter_mode)
             except Exception as auth_err:
-                return False, f"A API da NeoTS exigiu sessão autenticada (HTTP {http_err.code}) e o login automático retornou: {str(auth_err)}. Verifique o Login/Senha do painel NeoTS ou o Cookie na aba Configurar TS3."
+                return False, f"A API da NeoTS exigiu sessão autenticada (HTTP {http_err.code}) e o login automático retornou: {str(auth_err)}. Verifique o Cookie na aba Configurar TS3."
         else:
-            return False, (
-                f"A API da NeoTS retornou HTTP {http_err.code}. "
-                f"Preencha seu Login/Senha do site NeoTS (ou o Cookie da sessão) na aba Configurar TeamSpeak 3."
-            )
+            return False, f"A API da NeoTS retornou HTTP {http_err.code}. Verifique o Cookie da Sessão na aba Configurar TeamSpeak 3."
     except Exception as e:
         return False, f"Erro ao consultar API da NeoTS: {str(e)}"
 
     return False, "Não foi possível obter a lista de canais da API da NeoTS."
 
 def match_player_nick(registered_nick, online_clients_list):
-    """
-    Compara o nick cadastrado no site com a lista de objetos {'nick', 'channel_path'} vindos do TS3.
-    Aceita correspondência exata ou parcial (ex: 'nikee' bate com 'nikee ꧁ঔৣVIPঔৣ꧂').
-    """
     reg_clean = registered_nick.strip().lower()
     if not reg_clean:
         return None
@@ -650,22 +636,148 @@ def admin_required(f):
     return decorated
 
 # ==========================================
-# ROTAS PRINCIPAIS
+# ROTAS DE LOGIN, AUTO-CADASTRO E RESET DE SENHA SEM E-MAIL
 # ==========================================
+@app.route("/api/check_user_login")
+def api_check_user_login():
+    """
+    Endpoint consultado em tempo real quando o player digita o login na tela inicial.
+    Se o Admin já tiver aprovado o reset de senha dele, libera imediatamente o campo de criar Nova Senha!
+    """
+    username = request.args.get("username", "").strip()
+    if not username:
+        return jsonify({"exists": False, "reset_approved": False, "account_status": ""})
+
+    user = db_execute(
+        "SELECT username, account_status, reset_status FROM users WHERE LOWER(username) = LOWER(?)",
+        (username,), fetchone=True
+    )
+    if not user:
+        return jsonify({"exists": False, "reset_approved": False, "account_status": ""})
+
+    acc_status = user.get("account_status") or "ativo"
+    rst_status = user.get("reset_status") or "nenhum"
+    return jsonify({
+        "exists": True,
+        "username": user["username"],
+        "account_status": acc_status,
+        "reset_status": rst_status,
+        "reset_approved": (rst_status == "aprovado")
+    })
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    force_reset_username = request.args.get("reset_user", "").strip()
+
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
+        new_password = request.form.get("new_password", "").strip()
+        confirm_password = request.form.get("confirm_password", "").strip()
+
         user = db_execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
-        if user and check_password_hash(user["password_hash"], password):
+        if not user:
+            flash("Usuário não encontrado. Verifique o login ou clique em 'Criar Conta'.", "danger")
+            return render_template_string(LOGIN_HTML, force_reset_username="")
+
+        acc_status = user.get("account_status") or "ativo"
+        rst_status = user.get("reset_status") or "nenhum"
+
+        # 1. Verifica se a conta ainda está aguardando aprovação do Admin
+        if acc_status == "pendente":
+            flash("⏳ Seu cadastro já foi recebido e está aguardando a aprovação de um Administrador!", "warning")
+            return render_template_string(LOGIN_HTML, force_reset_username="")
+
+        # 2. Se o Admin aprovou o reset de senha deste player, permite criar a nova senha direto aqui!
+        if rst_status == "aprovado":
+            if new_password:
+                if len(new_password) < 3:
+                    flash("A nova senha precisa ter pelo menos 3 caracteres.", "warning")
+                    return render_template_string(LOGIN_HTML, force_reset_username=user["username"])
+                if confirm_password and new_password != confirm_password:
+                    flash("A confirmação da nova senha não confere.", "danger")
+                    return render_template_string(LOGIN_HTML, force_reset_username=user["username"])
+
+                db_execute(
+                    "UPDATE users SET password_hash = ?, reset_status = 'nenhum' WHERE id = ?",
+                    (generate_password_hash(new_password), user["id"])
+                )
+                session["user_id"] = user["id"]
+                session["username"] = user["username"]
+                session["ts_nick"] = user["ts_nick"]
+                session["role"] = user["role"]
+                flash("✅ Nova senha criada com sucesso! Bem-vindo de volta.", "success")
+                return redirect(url_for("dashboard"))
+            else:
+                flash("🔓 O Admin liberou a criação da sua nova senha! Digite sua nova senha abaixo.", "info")
+                return render_template_string(LOGIN_HTML, force_reset_username=user["username"])
+
+        # 3. Fluxo normal de login
+        if check_password_hash(user["password_hash"], password):
+            # Se o player logou normalmente, limpa eventual pedido de reset pendente
+            if rst_status != "nenhum":
+                db_execute("UPDATE users SET reset_status = 'nenhum' WHERE id = ?", (user["id"],))
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["ts_nick"] = user["ts_nick"]
             session["role"] = user["role"]
             return redirect(url_for("dashboard"))
-        flash("Login ou senha incorretos.", "danger")
-    return render_template_string(LOGIN_HTML)
+
+        flash("Senha incorreta. Se esqueceu sua senha, clique em 'Esqueci Minha Senha' abaixo.", "danger")
+
+    return render_template_string(LOGIN_HTML, force_reset_username=force_reset_username)
+
+@app.route("/register", methods=["POST"])
+def register_player():
+    username = request.form.get("username", "").strip()
+    ts_nick = request.form.get("ts_nick", "").strip()
+    password = request.form.get("password", "").strip()
+
+    if not username or not ts_nick or not password:
+        flash("Preencha Login, Nick do TS3 e Senha para solicitar seu cadastro.", "warning")
+        return redirect(url_for("login"))
+
+    exists = db_execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
+    if exists:
+        flash(f"O login '{username}' já existe no sistema. Escolha outro ou faça login.", "danger")
+        return redirect(url_for("login"))
+
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    db_execute("""
+        INSERT INTO users (username, password_hash, ts_nick, role, bonus_tkp, account_status, reset_status, created_at)
+        VALUES (?, ?, ?, 'player', 0, 'pendente', 'nenhum', ?)
+    """, (username, generate_password_hash(password), ts_nick, now_str))
+
+    flash(
+        f"✅ Cadastro de '{username}' (TS3: {ts_nick}) enviado com sucesso! "
+        f"Assim que o Administrador aprovar no painel, seu acesso estará liberado.",
+        "success"
+    )
+    return redirect(url_for("login"))
+
+@app.route("/forgot_password", methods=["POST"])
+def forgot_password_request():
+    username = request.form.get("username", "").strip()
+    if not username:
+        flash("Digite seu login para solicitar o reset de senha ao Admin.", "warning")
+        return redirect(url_for("login"))
+
+    user = db_execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,), fetchone=True)
+    if not user:
+        flash(f"Nenhuma conta encontrada com o login '{username}'.", "danger")
+        return redirect(url_for("login"))
+
+    if user.get("reset_status") == "aprovado":
+        flash("🔓 O Admin já aprovou seu reset! Digite sua nova senha abaixo.", "info")
+        return redirect(url_for("login", reset_user=user["username"]))
+
+    db_execute("UPDATE users SET reset_status = 'solicitado' WHERE id = ?", (user["id"],))
+    flash(
+        f"🔑 Pedido de nova senha para '{user['username']}' enviado ao Admin! "
+        f"Assim que o Admin aprovar, basta digitar seu login na tela de entrada para cadastrar a nova senha.",
+        "info"
+    )
+    return redirect(url_for("login"))
 
 @app.route("/logout")
 def logout():
@@ -678,6 +790,9 @@ def read_notifications():
     db_execute("UPDATE notifications SET is_read = 1 WHERE user_id = ?", (session["user_id"],))
     return redirect(request.referrer or url_for("dashboard"))
 
+# ==========================================
+# DASHBOARD PRINCIPAL
+# ==========================================
 @app.route("/")
 @login_required
 def dashboard():
@@ -686,8 +801,8 @@ def dashboard():
     tab = request.args.get("tab", "estoque")
     selected_event_id = request.args.get("event_id", type=int)
 
-    users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
-    users_map = {u["id"]: u for u in users}
+    all_users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
+    users_map = {u["id"]: u for u in all_users}
     events = db_execute("SELECT * FROM events ORDER BY id DESC", fetch=True)
     ts_cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
 
@@ -713,7 +828,11 @@ def dashboard():
     """, fetch=True)
     drop_counts = {r["winner_user_id"]: int(r["cnt"]) for r in won_rows}
 
-    for u in users:
+    active_users = []
+    pending_users = []
+    reset_requests = []
+
+    for u in all_users:
         w = wallets.get(u["id"], {})
         presences = w.get("presences", 0)
         u["presences"] = presences
@@ -724,6 +843,17 @@ def dashboard():
         u["locked_tkp"] = w.get("locked_tkp", 0)
         u["tkp_balance"] = w.get("tkp_balance", 0)
         u["available_to_bid"] = w.get("available_to_bid", 0)
+
+        acc_st = u.get("account_status") or "ativo"
+        rst_st = u.get("reset_status") or "nenhum"
+
+        if acc_st == "pendente":
+            pending_users.append(u)
+        else:
+            active_users.append(u)
+
+        if rst_st == "solicitado":
+            reset_requests.append(u)
 
     my_wallet = wallets.get(session["user_id"], {"tkp_balance": 0, "available_to_bid": 0, "locked_tkp": 0})
 
@@ -737,7 +867,7 @@ def dashboard():
     for e in stock_entries:
         entries_count_map[e["item_id"]] = entries_count_map.get(e["item_id"], 0) + 1
 
-    # 3. Drops Disponíveis para Saque (Soma consolidada de todas as datas)
+    # 3. Drops Disponíveis para Saque
     available_drops = []
     for item in catalog_items:
         item["tkp_value"] = int(item.get("tkp_value") or 0)
@@ -789,7 +919,9 @@ def dashboard():
     return render_template_string(
         MAIN_HTML,
         tab=tab,
-        users=users,
+        users=active_users,
+        pending_users=pending_users,
+        reset_requests=reset_requests,
         my_wallet=my_wallet,
         events=events,
         selected_event=selected_event,
@@ -803,6 +935,39 @@ def dashboard():
         total_events=total_events,
         db_mode="PostgreSQL (Railway)" if is_postgres() else "SQLite Local"
     )
+
+# ==========================================
+# ROTAS DE APROVAÇÃO DE PLAYERS E RESET DE SENHA (ADMIN)
+# ==========================================
+@app.route("/users/<int:user_id>/approve_account", methods=["POST"])
+@admin_required
+def approve_user_account(user_id):
+    u = db_execute("SELECT * FROM users WHERE id = ?", (user_id,), fetchone=True)
+    if u:
+        db_execute("UPDATE users SET account_status = 'ativo' WHERE id = ?", (user_id,))
+        create_notification(user_id, "✅ Sua conta foi aprovada pelo Administrador! Bem-vindo ao sistema do clã.")
+        flash(f"Cadastro do jogador '{u['username']}' (TS3: {u['ts_nick']}) APROVADO com sucesso!", "success")
+    return redirect(request.referrer or url_for("dashboard", tab="players"))
+
+@app.route("/users/<int:user_id>/approve_reset", methods=["POST"])
+@admin_required
+def approve_password_reset(user_id):
+    u = db_execute("SELECT * FROM users WHERE id = ?", (user_id,), fetchone=True)
+    if u:
+        db_execute("UPDATE users SET reset_status = 'aprovado' WHERE id = ?", (user_id,))
+        flash(
+            f"🔓 Reset de senha LIBERADO para '{u['username']}'! "
+            f"Assim que ele digitar o login '{u['username']}' na tela inicial, o campo de criar nova senha abrirá automaticamente.",
+            "success"
+        )
+    return redirect(request.referrer or url_for("dashboard", tab="players"))
+
+@app.route("/users/<int:user_id>/cancel_reset", methods=["POST"])
+@admin_required
+def cancel_password_reset(user_id):
+    db_execute("UPDATE users SET reset_status = 'nenhum' WHERE id = ?", (user_id,))
+    flash("Solicitação de reset de senha cancelada.", "info")
+    return redirect(request.referrer or url_for("dashboard", tab="players"))
 
 # ==========================================
 # ROTAS DA ABA 1: ESTOQUE (CADASTRO, LISTA SUSPENSA E ENTRADAS POR DATA)
@@ -936,7 +1101,7 @@ def delete_catalog_item(item_id):
     return redirect(url_for("dashboard", tab="saque"))
 
 # ==========================================
-# ROTAS DA ABA 2: SAQUES & LANCES EM TKP (COM TRAVA DE SALDO)
+# ROTAS DA ABA 2: SAQUES & LANCES EM TKP
 # ==========================================
 @app.route("/auctions/start", methods=["POST"])
 @admin_required
@@ -1115,7 +1280,7 @@ def sync_event_ts3(event_id):
     online_clients = result["online"]
     afk_list = result["afk"]
     filtered_out = result["filtered_out"]
-    users = db_execute("SELECT * FROM users", fetch=True)
+    users = db_execute("SELECT * FROM users WHERE account_status = 'ativo' OR account_status IS NULL", fetch=True)
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     matched_count = 0
@@ -1159,7 +1324,6 @@ def sync_event_ts3(event_id):
 @app.route("/events/<int:event_id>/manual_paste", methods=["POST"])
 @admin_required
 def manual_paste_ts3(event_id):
-    """Aceita colar TANTO o JSON da API da NeoTS QUANTO uma lista simples de nicks."""
     raw_text = request.form.get("raw_nicks", "").strip()
     filter_mode = request.form.get("filter_mode", "all").strip()
     cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
@@ -1167,7 +1331,6 @@ def manual_paste_ts3(event_id):
     ignore_keywords = [k.strip().lower() for k in ignore_raw if k.strip()]
 
     online_clients = []
-    # Verifica se o Admin colou o JSON da rota viewer?_neots_action=view_channels
     if raw_text.startswith("{") and '"clients"' in raw_text:
         try:
             data = json.loads(raw_text)
@@ -1181,7 +1344,7 @@ def manual_paste_ts3(event_id):
         lines = [l.strip() for l in raw_text.replace(",", "\n").splitlines() if l.strip()]
         online_clients = [{"nick": l, "channel_path": "Lista Manual"} for l in lines]
 
-    users = db_execute("SELECT * FROM users", fetch=True)
+    users = db_execute("SELECT * FROM users WHERE account_status = 'ativo' OR account_status IS NULL", fetch=True)
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     matched_count = 0
@@ -1254,11 +1417,11 @@ def create_user():
         return redirect(url_for("dashboard", tab="players"))
 
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-    db_execute(
-        "INSERT INTO users (username, password_hash, ts_nick, role, bonus_tkp, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (username, generate_password_hash(password), ts_nick, role, initial_tkp, now_str)
-    )
-    flash(f"Jogador '{username}' (Nick TS3: {ts_nick}) criado com sucesso!", "success")
+    db_execute("""
+        INSERT INTO users (username, password_hash, ts_nick, role, bonus_tkp, account_status, reset_status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'ativo', 'nenhum', ?)
+    """, (username, generate_password_hash(password), ts_nick, role, initial_tkp, now_str))
+    flash(f"Jogador '{username}' (Nick TS3: {ts_nick}) criado e já ativo!", "success")
     return redirect(url_for("dashboard", tab="players"))
 
 @app.route("/users/<int:user_id>/adjust_tkp", methods=["POST"])
@@ -1286,8 +1449,8 @@ def delete_user(user_id):
     db_execute("DELETE FROM notifications WHERE user_id = ?", (user_id,))
     db_execute("UPDATE auctions SET winner_user_id = NULL WHERE winner_user_id = ?", (user_id,))
     db_execute("DELETE FROM users WHERE id = ?", (user_id,))
-    flash("Jogador excluído do sistema.", "info")
-    return redirect(url_for("dashboard", tab="players"))
+    flash("Registro do jogador removido do sistema.", "info")
+    return redirect(request.referrer or url_for("dashboard", tab="players"))
 
 @app.route("/profile/update", methods=["POST"])
 @login_required
@@ -1347,7 +1510,7 @@ LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Login - Painel TS3, Estoque & Saque TKP</title>
+    <title>Acesso - TS3 Guild Tracker</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -1357,6 +1520,7 @@ LOGIN_HTML = """
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 1rem;
         }
         .login-card {
             background: #131926;
@@ -1364,20 +1528,36 @@ LOGIN_HTML = """
             border-radius: 14px;
             box-shadow: 0 15px 35px rgba(0,0,0,0.6);
             width: 100%;
-            max-width: 410px;
-            padding: 2.2rem;
+            max-width: 440px;
+            padding: 2rem;
         }
         .brand-icon {
-            width: 64px;
-            height: 64px;
+            width: 60px;
+            height: 60px;
             border-radius: 16px;
             background: linear-gradient(135deg, #3b82f6, #1d4ed8);
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.8rem;
-            margin: 0 auto 1rem;
+            font-size: 1.7rem;
+            margin: 0 auto 0.8rem;
             color: #fff;
+        }
+        .nav-pills .nav-link {
+            color: #94a3b8;
+            font-size: 0.85rem;
+            font-weight: 600;
+            border-radius: 8px;
+        }
+        .nav-pills .nav-link.active {
+            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            color: #fff;
+        }
+        .reset-unlocked-box {
+            border: 1px solid #10b981;
+            background: rgba(16, 185, 129, 0.1);
+            border-radius: 10px;
+            padding: 12px;
         }
     </style>
 </head>
@@ -1385,7 +1565,7 @@ LOGIN_HTML = """
     <div class="login-card">
         <div class="brand-icon"><i class="fa-solid fa-headset"></i></div>
         <h4 class="text-center fw-bold mb-1">TS3 Guild Tracker</h4>
-        <p class="text-center text-secondary small mb-4">Presença TS3 (1 Presença = 1 TKP) & Saque de Drops</p>
+        <p class="text-center text-secondary small mb-3">Presença TS3 (1 Presença = 1 TKP) & Saque de Drops</p>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
@@ -1395,26 +1575,188 @@ LOGIN_HTML = """
           {% endif %}
         {% endwith %}
 
-        <form method="POST">
-            <div class="mb-3">
-                <label class="form-label small text-secondary">Login do Player / Admin</label>
-                <div class="input-group">
-                    <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-user"></i></span>
-                    <input type="text" name="username" class="form-control bg-dark text-light border-secondary" required autofocus>
-                </div>
+        <!-- ABAS: ENTRAR / CRIAR CONTA / ESQUECI A SENHA -->
+        <ul class="nav nav-pills nav-fill gap-1 mb-4 bg-dark p-1 rounded-3 border border-secondary" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active py-1" id="tab-login-btn" data-bs-toggle="pill" data-bs-target="#pane-login" type="button" role="tab">
+                    <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link py-1" id="tab-register-btn" data-bs-toggle="pill" data-bs-target="#pane-register" type="button" role="tab">
+                    <i class="fa-solid fa-user-plus me-1"></i> Criar Conta
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link py-1" id="tab-forgot-btn" data-bs-toggle="pill" data-bs-target="#pane-forgot" type="button" role="tab">
+                    <i class="fa-solid fa-key me-1"></i> Reset Senha
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content">
+            <!-- ABA 1: LOGIN (COM DETECÇÃO AUTOMÁTICA DE RESET LIBERADO PELO ADMIN) -->
+            <div class="tab-pane fade show active" id="pane-login" role="tabpanel">
+                <form method="POST" action="{{ url_for('login') }}">
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Login do Player / Admin</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-user"></i></span>
+                            <input type="text" name="username" id="loginUsernameInput"
+                                   value="{{ force_reset_username }}"
+                                   class="form-control bg-dark text-light border-secondary"
+                                   placeholder="Digite seu login..." required autofocus
+                                   oninput="scheduleUserCheck(this.value)"
+                                   onblur="checkUserStatusNow(this.value)">
+                        </div>
+                        <div id="userStatusHint" class="small mt-1" style="display:none;"></div>
+                    </div>
+
+                    <!-- CAMPO DE SENHA NORMAL -->
+                    <div class="mb-4" id="normalPasswordGroup" {% if force_reset_username %}style="display:none;"{% endif %}>
+                        <label class="form-label small text-secondary">Senha</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-lock"></i></span>
+                            <input type="password" name="password" id="normalPasswordInput"
+                                   class="form-control bg-dark text-light border-secondary"
+                                   {% if not force_reset_username %}required{% endif %}>
+                        </div>
+                    </div>
+
+                    <!-- CAIXA QUE APARECE AUTOMATICAMENTE QUANDO O ADMIN LIBEROU O RESET DA SENHA -->
+                    <div class="mb-4 reset-unlocked-box" id="approvedResetGroup" {% if not force_reset_username %}style="display:none;"{% endif %}>
+                        <div class="small fw-bold text-success mb-2">
+                            <i class="fa-solid fa-unlock-keyhole me-1"></i>
+                            O Admin liberou a criação de uma nova senha para sua conta!
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small text-light mb-1">Digite sua Nova Senha</label>
+                            <input type="password" name="new_password" id="newPasswordInput"
+                                   class="form-control form-control-sm bg-dark text-warning border-success"
+                                   placeholder="Nova senha..."
+                                   {% if force_reset_username %}required{% endif %}>
+                        </div>
+                        <div>
+                            <label class="form-label small text-light mb-1">Confirmar Nova Senha</label>
+                            <input type="password" name="confirm_password" id="confirmPasswordInput"
+                                   class="form-control form-control-sm bg-dark text-warning border-success"
+                                   placeholder="Repita a nova senha...">
+                        </div>
+                    </div>
+
+                    <button type="submit" id="loginSubmitBtn" class="btn {% if force_reset_username %}btn-success{% else %}btn-primary{% endif %} w-100 fw-semibold py-2">
+                        {% if force_reset_username %}
+                            <i class="fa-solid fa-check-double me-1"></i> Salvar Nova Senha e Entrar
+                        {% else %}
+                            <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar no Sistema
+                        {% endif %}
+                    </button>
+                </form>
             </div>
-            <div class="mb-4">
-                <label class="form-label small text-secondary">Senha</label>
-                <div class="input-group">
-                    <span class="input-group-text bg-dark border-secondary"><i class="fa-solid fa-lock"></i></span>
-                    <input type="password" name="password" class="form-control bg-dark text-light border-secondary" required>
-                </div>
+
+            <!-- ABA 2: AUTO-CADASTRO DO PLAYER (VAI PARA APROVAÇÃO DO ADMIN) -->
+            <div class="tab-pane fade" id="pane-register" role="tabpanel">
+                <form method="POST" action="{{ url_for('register_player') }}">
+                    <div class="alert alert-info py-2 px-3 small mb-3">
+                        <i class="fa-solid fa-user-check me-1"></i>
+                        Crie sua conta abaixo. Seu acesso será liberado assim que um <strong>Administrador aprovar</strong> no painel.
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Escolha seu Login de Acesso</label>
+                        <input type="text" name="username" class="form-control bg-dark text-light border-secondary" placeholder="Ex: sinister" required>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label small text-secondary mb-1">Seu Nick no TeamSpeak 3</label>
+                        <input type="text" name="ts_nick" class="form-control bg-dark text-light border-secondary" placeholder="Ex: Sinister (sem precisar dos símbolos)" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary mb-1">Crie sua Senha</label>
+                        <input type="password" name="password" class="form-control bg-dark text-light border-secondary" placeholder="Sua senha de acesso" required>
+                    </div>
+                    <button type="submit" class="btn btn-success w-100 fw-semibold py-2">
+                        <i class="fa-solid fa-paper-plane me-1"></i> Solicitar Cadastro ao Admin
+                    </button>
+                </form>
             </div>
-            <button type="submit" class="btn btn-primary w-100 fw-semibold py-2">
-                <i class="fa-solid fa-right-to-bracket me-1"></i> Entrar no Sistema
-            </button>
-        </form>
+
+            <!-- ABA 3: ESQUECI MINHA SENHA (SEM E-MAIL, PEDE LIBERAÇÃO AO ADMIN) -->
+            <div class="tab-pane fade" id="pane-forgot" role="tabpanel">
+                <form method="POST" action="{{ url_for('forgot_password_request') }}">
+                    <div class="alert alert-warning py-2 px-3 small mb-3">
+                        <i class="fa-solid fa-key me-1"></i>
+                        Esqueceu a senha? Informe seu login abaixo para avisar o Admin. Assim que o Admin liberar, basta digitar seu login na aba <strong>Entrar</strong> que o campo de criar nova senha abrirá na hora!
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Qual é o seu Login?</label>
+                        <input type="text" name="username" class="form-control bg-dark text-light border-secondary" placeholder="Digite seu login cadastrado..." required>
+                    </div>
+                    <button type="submit" class="btn btn-warning text-dark w-100 fw-bold py-2">
+                        <i class="fa-solid fa-unlock me-1"></i> Pedir Liberação de Nova Senha
+                    </button>
+                </form>
+            </div>
+        </div>
     </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let checkTimer = null;
+
+        function scheduleUserCheck(val) {
+            clearTimeout(checkTimer);
+            checkTimer = setTimeout(() => checkUserStatusNow(val), 350);
+        }
+
+        async function checkUserStatusNow(username) {
+            const clean = (username || "").trim();
+            const normalGroup = document.getElementById('normalPasswordGroup');
+            const normalInput = document.getElementById('normalPasswordInput');
+            const resetGroup = document.getElementById('approvedResetGroup');
+            const newPassInput = document.getElementById('newPasswordInput');
+            const submitBtn = document.getElementById('loginSubmitBtn');
+            const hint = document.getElementById('userStatusHint');
+
+            if (!clean) {
+                hint.style.display = 'none';
+                return;
+            }
+
+            try {
+                const resp = await fetch(`/api/check_user_login?username=${encodeURIComponent(clean)}`);
+                const data = await resp.json();
+
+                if (data.exists && data.account_status === 'pendente') {
+                    hint.style.display = 'block';
+                    hint.className = 'small mt-1 text-warning';
+                    hint.innerHTML = '<i class="fa-solid fa-hourglass-half me-1"></i>Conta aguardando aprovação do Admin.';
+                } else if (data.exists && data.reset_status === 'solicitado') {
+                    hint.style.display = 'block';
+                    hint.className = 'small mt-1 text-info';
+                    hint.innerHTML = '<i class="fa-solid fa-clock me-1"></i>Pedido de reset enviado. Aguardando o Admin clicar em Liberar.';
+                } else {
+                    hint.style.display = 'none';
+                }
+
+                if (data.exists && data.reset_approved) {
+                    normalGroup.style.display = 'none';
+                    normalInput.removeAttribute('required');
+                    resetGroup.style.display = 'block';
+                    newPassInput.setAttribute('required', 'required');
+                    submitBtn.className = 'btn btn-success w-100 fw-semibold py-2';
+                    submitBtn.innerHTML = '<i class="fa-solid fa-check-double me-1"></i> Salvar Nova Senha e Entrar';
+                } else {
+                    resetGroup.style.display = 'none';
+                    newPassInput.removeAttribute('required');
+                    normalGroup.style.display = 'block';
+                    normalInput.setAttribute('required', 'required');
+                    submitBtn.className = 'btn btn-primary w-100 fw-semibold py-2';
+                    submitBtn.innerHTML = '<i class="fa-solid fa-right-to-bracket me-1"></i> Entrar no Sistema';
+                }
+            } catch (e) {
+                // Silencioso em caso de oscilação de rede
+            }
+        }
+    </script>
 </body>
 </html>
 """
@@ -1476,7 +1818,67 @@ MAIN_HTML = """
 
 <div class="container pb-5">
 
-    <!-- PAINEL DE NOTIFICAÇÕES -->
+    <!-- CENTRAL DE APROVAÇÕES DO ADMIN (NOVOS CADASTROS E PEDIDOS DE RESET DE SENHA) -->
+    {% if session['role'] == 'admin' and (pending_users or reset_requests) %}
+    <div class="card border-info bg-info bg-opacity-10 p-3 mb-4">
+        <h6 class="fw-bold text-info mb-2">
+            <i class="fa-solid fa-user-check me-1"></i> Solicitações Pendentes de Players (Aprovação do Admin)
+        </h6>
+
+        {% if pending_users %}
+        <div class="mb-2">
+            <div class="small fw-bold text-light mb-1">Novos Cadastros Aguardando Aprovação ({{ pending_users|length }}):</div>
+            <div class="d-flex flex-wrap gap-2">
+                {% for pu in pending_users %}
+                <div class="bg-dark border border-secondary rounded px-3 py-2 d-flex align-items-center gap-2">
+                    <div>
+                        <strong class="text-warning">{{ pu.username }}</strong>
+                        <span class="badge bg-secondary ms-1">TS3: {{ pu.ts_nick }}</span>
+                        <small class="text-secondary d-block" style="font-size:0.7rem;">Solicitado em {{ pu.created_at }}</small>
+                    </div>
+                    <form method="POST" action="{{ url_for('approve_user_account', user_id=pu.id) }}" class="d-inline ms-2">
+                        <button type="submit" class="btn btn-sm btn-success fw-bold py-0 px-2">
+                            <i class="fa-solid fa-check me-1"></i> Aprovar
+                        </button>
+                    </form>
+                    <form method="POST" action="{{ url_for('delete_user', user_id=pu.id) }}" class="d-inline" onsubmit="return confirm('Recusar e excluir este cadastro?');">
+                        <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
+                            <i class="fa-solid fa-xmark"></i>
+                        </button>
+                    </form>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if reset_requests %}
+        <div>
+            <div class="small fw-bold text-warning mb-1">Players que Esqueceram a Senha e Pediram Liberação ({{ reset_requests|length }}):</div>
+            <div class="d-flex flex-wrap gap-2">
+                {% for ru in reset_requests %}
+                <div class="bg-dark border border-warning rounded px-3 py-2 d-flex align-items-center gap-2">
+                    <div>
+                        <strong class="text-light">{{ ru.username }}</strong>
+                        <span class="badge bg-secondary ms-1">TS3: {{ ru.ts_nick }}</span>
+                    </div>
+                    <form method="POST" action="{{ url_for('approve_password_reset', user_id=ru.id) }}" class="d-inline ms-2">
+                        <button type="submit" class="btn btn-sm btn-warning text-dark fw-bold py-0 px-2">
+                            <i class="fa-solid fa-unlock me-1"></i> Aprovar Criar Nova Senha
+                        </button>
+                    </form>
+                    <form method="POST" action="{{ url_for('cancel_password_reset', user_id=ru.id) }}" class="d-inline">
+                        <button type="submit" class="btn btn-sm btn-outline-secondary py-0 px-2">Ignorar</button>
+                    </form>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- PAINEL DE NOTIFICAÇÕES DO JOGADOR -->
     {% if my_notifications %}
     <div class="card border-warning bg-warning bg-opacity-10 p-3 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-2">
@@ -1529,6 +1931,9 @@ MAIN_HTML = """
         <li class="nav-item">
             <a class="nav-link {% if tab == 'players' %}active{% endif %}" href="{{ url_for('dashboard', tab='players') }}">
                 <i class="fa-solid fa-users me-1"></i> Players & Carteira TKP
+                {% if session['role'] == 'admin' and (pending_users or reset_requests) %}
+                    <span class="badge bg-danger ms-1">{{ (pending_users|length) + (reset_requests|length) }}</span>
+                {% endif %}
             </a>
         </li>
         {% if session['role'] == 'admin' %}
@@ -2220,29 +2625,26 @@ MAIN_HTML = """
     {% endif %}
 
     <!-- ==========================================================
-         ABA 4: PLAYERS, RANKING & CARTEIRA TKP
+         ABA 4: PLAYERS, APROVAÇÕES, RESET DE SENHA & CARTEIRA TKP
          ========================================================== -->
     {% if tab == 'players' %}
     <div class="row g-4">
         {% if session['role'] == 'admin' %}
         <div class="col-lg-4">
             <div class="card p-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-success me-1"></i> Cadastrar Novo Player / Admin</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-user-plus text-success me-1"></i> Cadastrar Player Direto (Já Ativo)</h6>
                 <form method="POST" action="{{ url_for('create_user') }}">
                     <div class="mb-2">
                         <label class="form-label small text-secondary mb-1">Login de Acesso ao Site</label>
                         <input type="text" name="username" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                     </div>
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Senha do Player</label>
+                        <label class="form-label small text-secondary mb-1">Senha Inicial</label>
                         <input type="text" name="password" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                     </div>
                     <div class="mb-2">
                         <label class="form-label small text-secondary mb-1">Nick no TeamSpeak 3</label>
                         <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Sinister / GIGA / nikee" required>
-                        <div class="form-text text-secondary" style="font-size:0.7rem;">
-                            Reconhece automaticamente mesmo se tiver símbolos VIP ao lado do nick.
-                        </div>
                     </div>
                     <div class="row g-2 mb-3">
                         <div class="col-7">
@@ -2258,7 +2660,7 @@ MAIN_HTML = """
                         </div>
                     </div>
                     <button type="submit" class="btn btn-success btn-sm w-100 fw-semibold">
-                        <i class="fa-solid fa-check me-1"></i> Criar Conta do Player
+                        <i class="fa-solid fa-check me-1"></i> Criar Conta Ativa
                     </button>
                 </form>
             </div>
@@ -2267,7 +2669,7 @@ MAIN_HTML = """
 
         <div class="{% if session['role'] == 'admin' %}col-lg-8{% else %}col-lg-12{% endif %}">
             <div class="card p-3">
-                <h6 class="fw-bold mb-3"><i class="fa-solid fa-trophy text-warning me-1"></i> Membros, Presença TS3 & Carteira TKP</h6>
+                <h6 class="fw-bold mb-3"><i class="fa-solid fa-trophy text-warning me-1"></i> Membros Ativos, Carteira TKP & Reset de Senha</h6>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle table-dark-custom mb-0">
                         <thead>
@@ -2278,7 +2680,7 @@ MAIN_HTML = """
                                 <th>Presenças ({{ total_events }} Ev.)</th>
                                 <th>Drops Sacados</th>
                                 {% if session['role'] == 'admin' %}
-                                <th class="text-end">Ajustar TKP / Excluir</th>
+                                <th class="text-end">TKP / Senha / Excluir</th>
                                 {% endif %}
                             </tr>
                         </thead>
@@ -2291,6 +2693,11 @@ MAIN_HTML = """
                                         <span class="badge bg-primary" style="font-size:0.65rem;">Admin</span>
                                     {% else %}
                                         <span class="badge bg-dark border border-secondary" style="font-size:0.65rem;">Player</span>
+                                    {% endif %}
+                                    {% if u.reset_status == 'solicitado' %}
+                                        <span class="badge bg-warning text-dark ms-1" style="font-size:0.65rem;">Pediu Reset Senha</span>
+                                    {% elif u.reset_status == 'aprovado' %}
+                                        <span class="badge bg-success ms-1" style="font-size:0.65rem;">Nova Senha Liberada</span>
                                     {% endif %}
                                 </td>
                                 <td><span class="badge bg-secondary">{{ u.ts_nick }}</span></td>
@@ -2322,6 +2729,21 @@ MAIN_HTML = """
                                             <input type="hidden" name="delta" value="-1">
                                             <button type="submit" class="btn btn-sm btn-outline-warning py-0 px-2" title="Remover -1 TKP">-1</button>
                                         </form>
+
+                                        {% if u.reset_status != 'aprovado' %}
+                                        <form method="POST" action="{{ url_for('approve_password_reset', user_id=u.id) }}" class="d-inline">
+                                            <button type="submit" class="btn btn-sm btn-outline-info py-0 px-2" title="Liberar para este player criar uma nova senha ao digitar o login">
+                                                <i class="fa-solid fa-key"></i> Reset
+                                            </button>
+                                        </form>
+                                        {% else %}
+                                        <form method="POST" action="{{ url_for('cancel_password_reset', user_id=u.id) }}" class="d-inline">
+                                            <button type="submit" class="btn btn-sm btn-success py-0 px-2" title="Reset já liberado! Clique se quiser cancelar">
+                                                <i class="fa-solid fa-unlock"></i> Liberado
+                                            </button>
+                                        </form>
+                                        {% endif %}
+
                                         {% if u.id != session['user_id'] %}
                                         <form method="POST" action="{{ url_for('delete_user', user_id=u.id) }}" class="d-inline" onsubmit="return confirm('Excluir o jogador {{ u.username }}?');">
                                             <button type="submit" class="btn btn-sm btn-outline-danger py-0 px-2">
@@ -2364,18 +2786,18 @@ MAIN_HTML = """
 
                     <div class="row g-3 mb-3">
                         <div class="col-md-6">
-                            <label class="form-label small text-secondary">E-mail / Login do Painel NeoTS (Caso a API peça sessão)</label>
+                            <label class="form-label small text-secondary">E-mail / Login do Painel NeoTS (Opcional)</label>
                             <input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary" placeholder="Seu login no site neots.com.br">
                         </div>
                         <div class="col-md-6">
-                            <label class="form-label small text-secondary">Senha do Painel NeoTS</label>
+                            <label class="form-label small text-secondary">Senha do Painel NeoTS (Opcional)</label>
                             <input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary" placeholder="Sua senha no site neots.com.br">
                         </div>
                     </div>
 
                     <div class="mb-3">
-                        <label class="form-label small text-secondary">Cookie da Sessão NeoTS (Opcional - somente se o site tiver proteção Cloudflare no login)</label>
-                        <input type="text" name="neots_cookie" value="{{ ts_cfg.neots_cookie or '' }}" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Opcional: wordpress_logged_in_... copiado do F12 > Network">
+                        <label class="form-label small text-secondary">Cookie da Sessão NeoTS</label>
+                        <input type="text" name="neots_cookie" value="{{ ts_cfg.neots_cookie or '' }}" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="wordpress_logged_in_...">
                     </div>
 
                     <div class="row g-3 mb-4">
