@@ -1,7 +1,12 @@
 import os
+import re
+import json
 import time
 import socket
 import sqlite3
+import urllib.request
+import urllib.parse
+import http.cookiejar
 from urllib.parse import urlparse
 from datetime import datetime
 from functools import wraps
@@ -15,6 +20,8 @@ except ImportError:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "ts3_guild_tracker_secret_key_2026")
+
+DEFAULT_NEOTS_API_URL = "https://neots.com.br/wp-json/neots/v1/service/383/viewer?_neots_action=view_channels&force=1"
 
 # ==========================================
 # CAMADA DE BANCO DE DADOS (PG8000 / SQLITE)
@@ -104,25 +111,29 @@ def init_db():
     """)
     safe_add_column("users", "bonus_tkp INTEGER DEFAULT 0")
 
-    # 2. Configuração TS3
+    # 2. Configuração TS3 + Integração API NEO TEAMSPEAK
     db_execute("""
         CREATE TABLE IF NOT EXISTS ts_config (
             id INTEGER PRIMARY KEY,
-            host VARCHAR(150) DEFAULT '',
-            voice_port INTEGER DEFAULT 9987,
+            host VARCHAR(150) DEFAULT '157.151.9.204',
+            voice_port INTEGER DEFAULT 9971,
             query_port INTEGER DEFAULT 10011,
-            query_user VARCHAR(100) DEFAULT 'serveradmin',
+            query_user VARCHAR(100) DEFAULT '',
             query_pass VARCHAR(150) DEFAULT '',
-            ignore_channels TEXT DEFAULT 'AFK,Ausente'
+            ignore_channels TEXT DEFAULT 'AFK,Ausente',
+            neots_api_url TEXT DEFAULT '',
+            neots_cookie TEXT DEFAULT ''
         )
     """)
+    safe_add_column("ts_config", "neots_api_url TEXT DEFAULT ''")
+    safe_add_column("ts_config", "neots_cookie TEXT DEFAULT ''")
 
     # 3. Eventos e Presenças (1 Presença = +1 TKP)
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS events (
             id {id_col},
             title VARCHAR(150) NOT NULL,
-            event_type VARCHAR(80) DEFAULT 'Guerra / PvP',
+            event_type VARCHAR(80) DEFAULT 'GVG / TW',
             status VARCHAR(30) DEFAULT 'Aberto',
             created_at VARCHAR(40),
             last_sync VARCHAR(40) DEFAULT 'Nunca'
@@ -135,7 +146,7 @@ def init_db():
             event_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             ts_nick_found VARCHAR(150),
-            method VARCHAR(50) DEFAULT 'TS3 Auto',
+            method VARCHAR(120) DEFAULT 'NeoTS Auto',
             checked_at VARCHAR(40),
             UNIQUE(event_id, user_id)
         )
@@ -214,7 +225,7 @@ def init_db():
         )
     """)
 
-    # Backfill: garante registro de entrada para itens antigos caso existam
+    # Backfill de entradas de estoque
     existing_items = db_execute("SELECT * FROM inventory_items", fetch=True)
     for it in existing_items:
         has_entry = db_execute("SELECT id FROM inventory_entries WHERE item_id = ?", (it["id"],), fetchone=True)
@@ -232,12 +243,14 @@ def init_db():
                 it.get("updated_at") or datetime.now().strftime("%d/%m/%Y %H:%M")
             ))
 
-    cfg = db_execute("SELECT id FROM ts_config WHERE id = 1", fetchone=True)
+    cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
     if not cfg:
         db_execute("""
-            INSERT INTO ts_config (id, host, voice_port, query_port, query_user, query_pass, ignore_channels)
-            VALUES (1, '', 9987, 10011, 'serveradmin', '', 'AFK,Ausente')
-        """)
+            INSERT INTO ts_config (id, host, voice_port, query_port, query_user, query_pass, ignore_channels, neots_api_url, neots_cookie)
+            VALUES (1, '157.151.9.204', 9971, 10011, '', '', 'AFK,Ausente', ?, '')
+        """, (DEFAULT_NEOTS_API_URL,))
+    elif not cfg.get("neots_api_url"):
+        db_execute("UPDATE ts_config SET neots_api_url = ? WHERE id = 1", (DEFAULT_NEOTS_API_URL,))
 
     admin = db_execute("SELECT id FROM users WHERE username = ?", ("admin",), fetchone=True)
     if not admin:
@@ -247,7 +260,7 @@ def init_db():
         """, (
             "admin",
             generate_password_hash("admin123"),
-            "AdminTS",
+            "Sinister",
             "admin",
             datetime.now().strftime("%d/%m/%Y %H:%M")
         ))
@@ -265,15 +278,6 @@ def create_notification(user_id, message):
     )
 
 def calculate_wallets(exclude_auction_id=None):
-    """
-    Calcula para todos os usuários:
-    - presences: total de presenças em eventos (1 presença = 1 TKP)
-    - bonus_tkp: ajustes manuais feitos pelo Admin
-    - spent_tkp: soma dos lances vencidos ('Aguardando Entrega' ou 'Entregue (OK)')
-    - locked_tkp: soma dos lances ativos do usuário em leilões ainda abertos
-    - tkp_balance: saldo total na carteira (presences + bonus - spent)
-    - available_to_bid: saldo livre para novos lances (tkp_balance - locked_tkp)
-    """
     users = db_execute("SELECT id, bonus_tkp FROM users", fetch=True)
     att_rows = db_execute("SELECT user_id, COUNT(*) as cnt FROM attendance GROUP BY user_id", fetch=True)
     att_map = {r["user_id"]: int(r["cnt"]) for r in att_rows}
@@ -286,7 +290,6 @@ def calculate_wallets(exclude_auction_id=None):
     """, fetch=True)
     spent_map = {r["winner_user_id"]: int(r["total_spent"] or 0) for r in spent_rows}
 
-    # Lances ativos em leilões abertos no momento
     open_auctions = db_execute(
         "SELECT id, round_number FROM auctions WHERE status IN ('Aberto', 'Em Desempate')",
         fetch=True
@@ -400,7 +403,7 @@ def resolve_expired_auctions(force_auction_id=None):
             tied_ids_str = ",".join(str(b["user_id"]) for b in top_bidders)
             tied_names = ", ".join(b["username"] for b in top_bidders)
             new_round = rnd + 1
-            new_end_epoch = int(time.time()) + 360  # 6 minutos (360 segundos)
+            new_end_epoch = int(time.time()) + 360  # 6 minutos
             new_end_str = datetime.fromtimestamp(new_end_epoch).strftime("%d/%m %H:%M:%S")
 
             db_execute("""
@@ -422,130 +425,206 @@ def resolve_expired_auctions(force_auction_id=None):
                 )
 
 # ==========================================
-# INTEGRAÇÃO NATIVA TEAMSPEAK 3 SERVERQUERY
+# INTEGRAÇÃO API NEO TEAMSPEAK (JSON) + ÁRVORE DE CANAIS (GVG / TW / AFK)
 # ==========================================
-def ts3_escape(text):
-    if not text:
+def clean_channel_label(name):
+    """Remove tags visuais como [cspacer1] ou bullets para exibir o nome limpo da sala."""
+    if not name:
         return ""
-    return (str(text)
-            .replace("\\", "\\\\")
-            .replace("/", "\\/")
-            .replace(" ", "\\s")
-            .replace("|", "\\p"))
+    cleaned = re.sub(r"\[[^\]]*spacer[^\]]*\]", "", str(name), flags=re.IGNORECASE)
+    cleaned = cleaned.replace("•", "").strip()
+    return cleaned or str(name).strip()
 
-def ts3_unescape(text):
-    if not text:
-        return ""
-    return (str(text)
-            .replace("\\s", " ")
-            .replace("\\/", "/")
-            .replace("\\p", "|")
-            .replace("\\\\", "\\"))
+def build_channel_hierarchy(channels_list):
+    """
+    Constrói um dicionário {cid: {"name": ..., "full_path": ...}} subindo pelos 'pid'.
+    Exemplo: cid="70" ('• PT 01 - CATAPULTA') -> pid="69" ('• Ataque') -> pid="68" ('[cspacer1]TW')
+    Resultado full_path: 'TW > Ataque > PT 01 - CATAPULTA'
+    """
+    by_cid = {}
+    for ch in channels_list:
+        cid = str(ch.get("cid") or ch.get("channel_id") or "")
+        if cid:
+            by_cid[cid] = ch
 
-def recv_until_prompt(sock):
-    buffer = b""
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buffer += chunk
-        if b"error id=" in buffer:
-            break
-    return buffer.decode("utf-8", errors="ignore")
+    hierarchy = {}
+    for cid, ch in by_cid.items():
+        path_parts = []
+        curr = ch
+        visited = set()
+        while curr:
+            c_id = str(curr.get("cid") or curr.get("channel_id") or "")
+            if not c_id or c_id in visited:
+                break
+            visited.add(c_id)
+            label = clean_channel_label(curr.get("channel_name", ""))
+            if label:
+                path_parts.insert(0, label)
+            pid = str(curr.get("pid") or "0")
+            if pid == "0" or pid not in by_cid:
+                break
+            curr = by_cid[pid]
 
-def fetch_ts3_online_clients(cfg):
-    host = (cfg.get("host") or "").strip()
-    voice_port = int(cfg.get("voice_port") or 9987)
-    query_port = int(cfg.get("query_port") or 10011)
-    user = (cfg.get("query_user") or "").strip()
-    password = (cfg.get("query_pass") or "").strip()
-    ignore_raw = (cfg.get("ignore_channels") or "").split(",")
+        full_path = " > ".join(path_parts) if path_parts else clean_channel_label(ch.get("channel_name", ""))
+        hierarchy[cid] = {
+            "name": clean_channel_label(ch.get("channel_name", "")),
+            "raw_name": ch.get("channel_name", ""),
+            "full_path": full_path
+        }
+    return hierarchy
+
+def parse_neots_json_payload(data, ignore_keywords, filter_mode="all"):
+    """
+    Processa o JSON da NeoTS (chaves 'channels' e 'clients') e aplica:
+    - Ignorar salas AFK/Ausente
+    - Filtro de modalidade ('all', 'gvg_tw', 'gvg', 'tw', 'eventos')
+    """
+    if not isinstance(data, dict) or "clients" not in data:
+        return False, "Formato JSON inesperado retornado pela API (chave 'clients' ausente)."
+
+    channels_list = data.get("channels") or []
+    clients_list = data.get("clients") or []
+    hierarchy = build_channel_hierarchy(channels_list)
+
+    online_clients = []
+    skipped_afk = []
+    skipped_filter = []
+
+    for cl in clients_list:
+        if str(cl.get("client_type", "0")) != "0":
+            continue
+        nick = (cl.get("client_nickname") or "").strip()
+        if not nick:
+            continue
+        cid = str(cl.get("cid") or "")
+        ch_info = hierarchy.get(cid, {"name": f"Canal {cid}", "full_path": f"Canal {cid}"})
+        full_path = ch_info["full_path"]
+        path_lower = full_path.lower()
+
+        # 1. Verifica se está em sala de AFK / Ausente
+        if ignore_keywords and any(kw in path_lower for kw in ignore_keywords):
+            skipped_afk.append(f"{nick} ({full_path})")
+            continue
+
+        # 2. Aplica o filtro de canal selecionado pelo Admin (GVG, TW, Eventos ou Todas)
+        if filter_mode == "gvg_tw":
+            if not ("gvg" in path_lower or "tw" in path_lower):
+                skipped_filter.append(f"{nick} ({full_path})")
+                continue
+        elif filter_mode == "gvg":
+            if "gvg" not in path_lower:
+                skipped_filter.append(f"{nick} ({full_path})")
+                continue
+        elif filter_mode == "tw":
+            if "tw" not in path_lower:
+                skipped_filter.append(f"{nick} ({full_path})")
+                continue
+        elif filter_mode == "eventos":
+            if "eventos" not in path_lower and "artes marciais" not in path_lower and "tigres" not in path_lower:
+                skipped_filter.append(f"{nick} ({full_path})")
+                continue
+
+        online_clients.append({
+            "nick": nick,
+            "cid": cid,
+            "channel_name": ch_info["name"],
+            "channel_path": full_path
+        })
+
+    return True, {
+        "online": online_clients,
+        "afk": skipped_afk,
+        "filtered_out": skipped_filter
+    }
+
+def fetch_neots_api_clients(cfg, filter_mode="all"):
+    """
+    Conecta na URL da API da NEO TEAMSPEAK (com suporte a Cookie ou Login automático no WordPress da NeoTS).
+    """
+    api_url = (cfg.get("neots_api_url") or DEFAULT_NEOTS_API_URL).strip()
+    neots_user = (cfg.get("query_user") or "").strip()
+    neots_pass = (cfg.get("query_pass") or "").strip()
+    neots_cookie = (cfg.get("neots_cookie") or "").strip()
+    ignore_raw = (cfg.get("ignore_channels") or "AFK,Ausente").split(",")
     ignore_keywords = [k.strip().lower() for k in ignore_raw if k.strip()]
 
-    if not host:
-        return False, "Host/IP do TeamSpeak 3 não configurado no painel."
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://neots.com.br/"
+    }
+    if neots_cookie:
+        headers["Cookie"] = neots_cookie
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(8.0)
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
+    # 1ª Tentativa: Requisição direta na URL da API (com ou sem Cookie configurado)
     try:
-        sock.connect((host, query_port))
-        sock.recv(1024)
+        req = urllib.request.Request(api_url, headers=headers, method="GET")
+        with opener.open(req, timeout=10) as resp:
+            raw_body = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw_body)
+            if isinstance(data, dict) and "clients" in data:
+                return parse_neots_json_payload(data, ignore_keywords, filter_mode=filter_mode)
+    except urllib.error.HTTPError as http_err:
+        # Se retornou 401/403 e o Admin preencheu login/senha do painel NeoTS, tenta autenticar no WordPress
+        if http_err.code in (401, 403) and neots_user and neots_pass:
+            try:
+                login_url = "https://neots.com.br/wp-login.php"
+                login_data = urllib.parse.urlencode({
+                    "log": neots_user,
+                    "pwd": neots_pass,
+                    "wp-submit": "Acessar",
+                    "redirect_to": "https://neots.com.br/painel/",
+                    "testcookie": "1"
+                }).encode("utf-8")
+                login_headers = dict(headers)
+                login_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                login_req = urllib.request.Request(login_url, data=login_data, headers=login_headers, method="POST")
+                with opener.open(login_req, timeout=10) as login_resp:
+                    panel_html = login_resp.read().decode("utf-8", errors="ignore")
+                    # Captura X-WP-Nonce caso esteja presente no HTML do painel
+                    nonce_match = re.search(r'"nonce"\s*:\s*"([a-zA-Z0-9]+)"', panel_html)
+                    if nonce_match:
+                        headers["X-WP-Nonce"] = nonce_match.group(1)
 
-        if user and password:
-            cmd_login = f"login client_login_name={ts3_escape(user)} client_login_password={ts3_escape(password)}\n"
-            sock.sendall(cmd_login.encode("utf-8"))
-            resp_login = recv_until_prompt(sock)
-            if "error id=0" not in resp_login:
-                return False, f"Falha no login do ServerQuery: {resp_login.strip()}"
-
-        sock.sendall(f"use port={voice_port}\n".encode("utf-8"))
-        resp_use = recv_until_prompt(sock)
-        if "error id=0" not in resp_use:
-            return False, f"Erro ao selecionar porta de voz {voice_port}: {resp_use.strip()}"
-
-        ignored_channel_ids = set()
-        if ignore_keywords:
-            sock.sendall(b"channellist\n")
-            resp_channels = recv_until_prompt(sock)
-            for line in resp_channels.splitlines():
-                if "cid=" in line:
-                    for item in line.split("|"):
-                        props = {}
-                        for part in item.split(" "):
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                props[k] = ts3_unescape(v)
-                        cid = props.get("cid")
-                        cname = (props.get("channel_name") or "").lower()
-                        if cid and any(kw in cname for kw in ignore_keywords):
-                            ignored_channel_ids.add(cid)
-
-        sock.sendall(b"clientlist\n")
-        resp_clients = recv_until_prompt(sock)
-        if "error id=0" not in resp_clients:
-            return False, f"Permissão negada ou erro ao rodar clientlist: {resp_clients.strip()}"
-
-        online_nicks = []
-        skipped_afk = []
-
-        for line in resp_clients.splitlines():
-            if "clid=" in line:
-                for item in line.split("|"):
-                    props = {}
-                    for part in item.split(" "):
-                        if "=" in part:
-                            k, v = part.split("=", 1)
-                            props[k] = ts3_unescape(v)
-                    if props.get("client_type") == "0":
-                        nick = props.get("client_nickname", "").strip()
-                        cid = props.get("cid")
-                        if nick:
-                            if cid in ignored_channel_ids:
-                                skipped_afk.append(nick)
-                            else:
-                                online_nicks.append(nick)
-
-        try:
-            sock.sendall(b"quit\n")
-        except Exception:
-            pass
-
-        return True, {"online": online_nicks, "afk": skipped_afk}
-
+                # Repete a chamada na API agora autenticado
+                req2 = urllib.request.Request(api_url, headers=headers, method="GET")
+                with opener.open(req2, timeout=10) as resp2:
+                    raw_body2 = resp2.read().decode("utf-8", errors="ignore")
+                    data2 = json.loads(raw_body2)
+                    return parse_neots_json_payload(data2, ignore_keywords, filter_mode=filter_mode)
+            except Exception as auth_err:
+                return False, f"A API da NeoTS exigiu sessão autenticada (HTTP {http_err.code}) e o login automático retornou: {str(auth_err)}. Verifique o Login/Senha do painel NeoTS ou o Cookie na aba Configurar TS3."
+        else:
+            return False, (
+                f"A API da NeoTS retornou HTTP {http_err.code}. "
+                f"Preencha seu Login/Senha do site NeoTS (ou o Cookie da sessão) na aba Configurar TeamSpeak 3."
+            )
     except Exception as e:
-        return False, f"Erro de conexão com o TS3 ({host}:{query_port}): {str(e)}"
-    finally:
-        sock.close()
+        return False, f"Erro ao consultar API da NeoTS: {str(e)}"
 
-def match_player_nick(registered_nick, ts_online_nicks):
+    return False, "Não foi possível obter a lista de canais da API da NeoTS."
+
+def match_player_nick(registered_nick, online_clients_list):
+    """
+    Compara o nick cadastrado no site com a lista de objetos {'nick', 'channel_path'} vindos do TS3.
+    Aceita correspondência exata ou parcial (ex: 'nikee' bate com 'nikee ꧁ঔৣVIPঔৣ꧂').
+    """
     reg_clean = registered_nick.strip().lower()
     if not reg_clean:
         return None
-    for online in ts_online_nicks:
-        on_clean = online.strip().lower()
+    for cl in online_clients_list:
+        if isinstance(cl, dict):
+            on_nick = cl.get("nick", "").strip()
+            ch_path = cl.get("channel_path", "")
+        else:
+            on_nick = str(cl).strip()
+            ch_path = "Lista Manual"
+        on_clean = on_nick.lower()
         if reg_clean == on_clean or reg_clean in on_clean:
-            return online
+            return {"nick": on_nick, "channel_path": ch_path}
     return None
 
 # ==========================================
@@ -922,7 +1001,6 @@ def place_bid(auction_id):
         flash(f"O lance mínimo inicial é {min_allowed} TKP.", "warning")
         return redirect(url_for("dashboard", tab="saque"))
 
-    # Validação de Saldo de TKP na Carteira do Jogador
     wallets = calculate_wallets(exclude_auction_id=auction_id)
     user_wallet = wallets.get(uid, {"available_to_bid": 0, "tkp_balance": 0})
     max_can_bid = int(user_wallet["available_to_bid"])
@@ -1000,20 +1078,20 @@ def delete_auction(auction_id):
     return redirect(url_for("dashboard", tab="saque"))
 
 # ==========================================
-# ROTAS DE EVENTOS, PLAYERS E TS3 (1 PRESENÇA = +1 TKP)
+# ROTAS DE EVENTOS, PLAYERS E CHAMADA NEOTS (1 PRESENÇA = +1 TKP)
 # ==========================================
 @app.route("/events/create", methods=["POST"])
 @admin_required
 def create_event():
     title = request.form.get("title", "").strip()
-    event_type = request.form.get("event_type", "Guerra / PvP").strip()
+    event_type = request.form.get("event_type", "GVG / TW").strip()
     if title:
         now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
         db_execute(
             "INSERT INTO events (title, event_type, status, created_at) VALUES (?, ?, 'Aberto', ?)",
             (title, event_type, now_str)
         )
-        flash(f"Evento '{title}' criado! Agora você já pode puxar a presença do TS3 (+1 TKP por presença).", "success")
+        flash(f"Evento '{title}' criado! Escolha o filtro de salas (GVG/TW ou Todas) e puxe a presença.", "success")
     return redirect(url_for("dashboard", tab="eventos"))
 
 @app.route("/events/<int:event_id>/delete", methods=["POST"])
@@ -1027,73 +1105,113 @@ def delete_event(event_id):
 @app.route("/events/<int:event_id>/sync_ts3", methods=["POST"])
 @admin_required
 def sync_event_ts3(event_id):
+    filter_mode = request.form.get("filter_mode", "all").strip()
     cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
-    ok, result = fetch_ts3_online_clients(cfg)
+    ok, result = fetch_neots_api_clients(cfg, filter_mode=filter_mode)
     if not ok:
         flash(result, "danger")
         return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
-    online_nicks = result["online"]
-    afk_nicks = result["afk"]
+    online_clients = result["online"]
+    afk_list = result["afk"]
+    filtered_out = result["filtered_out"]
     users = db_execute("SELECT * FROM users", fetch=True)
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     matched_count = 0
     new_tkp_awarded = 0
     for u in users:
-        found_nick = match_player_nick(u["ts_nick"], online_nicks)
-        if found_nick:
+        match = match_player_nick(u["ts_nick"], online_clients)
+        if match:
             matched_count += 1
+            found_nick = match["nick"]
+            ch_path = match["channel_path"]
+            method_label = f"Sala: {ch_path}"[:115]
             existing = db_execute(
                 "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
                 (event_id, u["id"]), fetchone=True
             )
             if existing:
                 db_execute(
-                    "UPDATE attendance SET ts_nick_found = ?, method = 'TS3 Auto', checked_at = ? WHERE id = ?",
-                    (found_nick, now_str, existing["id"])
+                    "UPDATE attendance SET ts_nick_found = ?, method = ?, checked_at = ? WHERE id = ?",
+                    (found_nick, method_label, now_str, existing["id"])
                 )
             else:
                 new_tkp_awarded += 1
                 db_execute(
-                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'TS3 Auto', ?)",
-                    (event_id, u["id"], found_nick, now_str)
+                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, ?, ?)",
+                    (event_id, u["id"], found_nick, method_label, now_str)
                 )
-                create_notification(u["id"], "💰 Você ganhou +1 TKP por presença contabilizada no TeamSpeak 3!")
+                create_notification(u["id"], f"💰 Você ganhou +1 TKP por presença no TS3 ({ch_path})!")
 
     db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
-    msg = f"Varredura TS3 concluída! {len(online_nicks)} online no TS3 | {matched_count} presentes ({new_tkp_awarded} novos receberam +1 TKP)."
-    if afk_nicks:
-        msg += f" ({len(afk_nicks)} ignorados em sala AFK)."
+    msg = (
+        f"Leitura NeoTS concluída! {len(online_clients)} jogador(es) nas salas válidas | "
+        f"{matched_count} cadastrado(s) presente(s) ({new_tkp_awarded} ganharam +1 TKP)."
+    )
+    if afk_list:
+        msg += f" [{len(afk_list)} ignorado(s) em AFK/Ausente]."
+    if filtered_out:
+        msg += f" [{len(filtered_out)} fora do filtro {filter_mode.upper()}]."
     flash(msg, "success")
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
 @app.route("/events/<int:event_id>/manual_paste", methods=["POST"])
 @admin_required
 def manual_paste_ts3(event_id):
-    raw_text = request.form.get("raw_nicks", "")
-    lines = [l.strip() for l in raw_text.replace(",", "\n").splitlines() if l.strip()]
+    """Aceita colar TANTO o JSON da API da NeoTS QUANTO uma lista simples de nicks."""
+    raw_text = request.form.get("raw_nicks", "").strip()
+    filter_mode = request.form.get("filter_mode", "all").strip()
+    cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
+    ignore_raw = (cfg.get("ignore_channels") or "AFK,Ausente").split(",")
+    ignore_keywords = [k.strip().lower() for k in ignore_raw if k.strip()]
+
+    online_clients = []
+    # Verifica se o Admin colou o JSON da rota viewer?_neots_action=view_channels
+    if raw_text.startswith("{") and '"clients"' in raw_text:
+        try:
+            data = json.loads(raw_text)
+            ok, parsed = parse_neots_json_payload(data, ignore_keywords, filter_mode=filter_mode)
+            if ok:
+                online_clients = parsed["online"]
+        except Exception as e:
+            flash(f"Erro ao ler o JSON colado: {str(e)}", "danger")
+            return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
+    else:
+        lines = [l.strip() for l in raw_text.replace(",", "\n").splitlines() if l.strip()]
+        online_clients = [{"nick": l, "channel_path": "Lista Manual"} for l in lines]
+
     users = db_execute("SELECT * FROM users", fetch=True)
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     matched_count = 0
+    new_tkp = 0
     for u in users:
-        found_nick = match_player_nick(u["ts_nick"], lines)
-        if found_nick:
+        match = match_player_nick(u["ts_nick"], online_clients)
+        if match:
             matched_count += 1
+            found_nick = match["nick"]
+            ch_path = match["channel_path"]
+            method_label = f"Sala: {ch_path}"[:115]
             existing = db_execute(
                 "SELECT id FROM attendance WHERE event_id = ? AND user_id = ?",
                 (event_id, u["id"]), fetchone=True
             )
-            if not existing:
+            if existing:
                 db_execute(
-                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, 'Lista TS3', ?)",
-                    (event_id, u["id"], found_nick, now_str)
+                    "UPDATE attendance SET ts_nick_found = ?, method = ?, checked_at = ? WHERE id = ?",
+                    (found_nick, method_label, now_str, existing["id"])
                 )
-                create_notification(u["id"], "💰 Você ganhou +1 TKP por presença registrada via lista do TS3!")
+            else:
+                new_tkp += 1
+                db_execute(
+                    "INSERT INTO attendance (event_id, user_id, ts_nick_found, method, checked_at) VALUES (?, ?, ?, ?, ?)",
+                    (event_id, u["id"], found_nick, method_label, now_str)
+                )
+                create_notification(u["id"], f"💰 Você ganhou +1 TKP por presença registrada no TS3 ({ch_path})!")
 
     db_execute("UPDATE events SET last_sync = ? WHERE id = ?", (now_str, event_id))
-    flash(f"{matched_count} presenças contabilizadas a partir da lista de nicks (+1 TKP por nova presença)!", "success")
+    flash(f"{matched_count} presença(s) contabilizada(s) ({new_tkp} novas receberam +1 TKP)!", "success")
     return redirect(url_for("dashboard", tab="eventos", event_id=event_id))
 
 @app.route("/events/<int:event_id>/toggle_user/<int:user_id>", methods=["POST"])
@@ -1190,30 +1308,33 @@ def update_profile():
 @app.route("/tsconfig/save", methods=["POST"])
 @admin_required
 def save_tsconfig():
-    host = request.form.get("host", "").strip()
-    voice_port = int(request.form.get("voice_port") or 9987)
-    query_port = int(request.form.get("query_port") or 10011)
+    neots_api_url = request.form.get("neots_api_url", "").strip() or DEFAULT_NEOTS_API_URL
     query_user = request.form.get("query_user", "").strip()
     query_pass = request.form.get("query_pass", "").strip()
+    neots_cookie = request.form.get("neots_cookie", "").strip()
     ignore_channels = request.form.get("ignore_channels", "").strip()
+    host = request.form.get("host", "157.151.9.204").strip()
+    voice_port = int(request.form.get("voice_port") or 9971)
 
     db_execute("""
         UPDATE ts_config
-        SET host = ?, voice_port = ?, query_port = ?, query_user = ?, query_pass = ?, ignore_channels = ?
+        SET neots_api_url = ?, query_user = ?, query_pass = ?, neots_cookie = ?,
+            ignore_channels = ?, host = ?, voice_port = ?
         WHERE id = 1
-    """, (host, voice_port, query_port, query_user, query_pass, ignore_channels))
+    """, (neots_api_url, query_user, query_pass, neots_cookie, ignore_channels, host, voice_port))
 
     action = request.form.get("action", "save")
     if action == "test":
         cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
-        ok, res = fetch_ts3_online_clients(cfg)
+        ok, res = fetch_neots_api_clients(cfg, filter_mode="all")
         if ok:
-            nicks_str = ", ".join(res["online"]) if res["online"] else "Nenhum cliente de voz conectado agora"
-            flash(f"Conexão TS3 OK! Online nas salas válidas ({len(res['online'])}): {nicks_str}", "success")
+            online_list = [f"{c['nick']} [{c['channel_path']}]" for c in res["online"]]
+            nicks_str = ", ".join(online_list) if online_list else "Nenhum jogador nas salas válidas agora"
+            flash(f"API NeoTS Conectada com Sucesso! Online ({len(online_list)}): {nicks_str}", "success")
         else:
             flash(res, "danger")
     else:
-        flash("Configurações do TeamSpeak 3 salvas com sucesso!", "success")
+        flash("Configurações da API NEO TEAMSPEAK salvas com sucesso!", "success")
 
     return redirect(url_for("dashboard", tab="tsconfig"))
 
@@ -1470,7 +1591,7 @@ MAIN_HTML = """
                     </div>
                     <div class="mb-3">
                         <label class="form-label small text-secondary mb-1">Boss / Origem da Entrada</label>
-                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Boss Kundun / Evento 21h">
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: GVG / TW / Boss">
                     </div>
                     <button type="submit" class="btn btn-info btn-sm w-100 fw-bold text-dark" {% if not catalog_items %}disabled{% endif %}>
                         <i class="fa-solid fa-layer-group me-1"></i> Acumular Quantidade no Estoque
@@ -1489,7 +1610,7 @@ MAIN_HTML = """
                 <form method="POST" action="{{ url_for('create_new_inventory_item') }}">
                     <div class="mb-2">
                         <label class="form-label small text-secondary mb-1">Nome do Novo Item (Drop)</label>
-                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Espada Lendária +15" required>
+                        <input type="text" name="item_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Joia / Equipamento" required>
                     </div>
                     <div class="row g-2 mb-2">
                         <div class="col-4">
@@ -1516,7 +1637,7 @@ MAIN_HTML = """
                     </div>
                     <div class="mb-3">
                         <label class="form-label small text-secondary mb-1">Boss / Origem</label>
-                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Dragão Vermelho">
+                        <input type="text" name="boss_source" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: TW / GVG">
                     </div>
                     <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">
                         <i class="fa-solid fa-box-archive me-1"></i> Cadastrar Item & Gerar 1ª Entrada
@@ -1924,7 +2045,7 @@ MAIN_HTML = """
     {% endif %}
 
     <!-- ==========================================================
-         ABA 3: EVENTOS & CHAMADA TS3 (1 PRESENÇA = +1 TKP)
+         ABA 3: EVENTOS & CHAMADA TS3 (COM FILTRO GVG / TW / TODAS)
          ========================================================== -->
     {% if tab == 'eventos' %}
     <div class="row g-4">
@@ -1934,16 +2055,17 @@ MAIN_HTML = """
                 <h6 class="fw-bold mb-3"><i class="fa-solid fa-plus-circle text-primary me-1"></i> Iniciar Novo Evento</h6>
                 <form method="POST" action="{{ url_for('create_event') }}">
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nome do Evento / Boss</label>
-                        <input type="text" name="title" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Castle Siege 21h / Boss Raid" required>
+                        <label class="form-label small text-secondary mb-1">Nome do Evento / Guerra</label>
+                        <input type="text" name="title" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: TW Sábado 20h / GVG" required>
                     </div>
                     <div class="mb-3">
-                        <label class="form-label small text-secondary mb-1">Tipo</label>
+                        <label class="form-label small text-secondary mb-1">Modalidade</label>
                         <select name="event_type" class="form-select form-select-sm bg-dark text-light border-secondary">
-                            <option value="Guerra / PvP">Guerra / PvP</option>
-                            <option value="Boss / Raid">Boss / Raid</option>
-                            <option value="Evento Diário">Evento Diário</option>
-                            <option value="Reunião TS3">Reunião TS3</option>
+                            <option value="GVG + TW">GVG + TW</option>
+                            <option value="TW (Ataque / Defesa)">TW (Ataque / Defesa)</option>
+                            <option value="GVG">GVG</option>
+                            <option value="Artes Marciais / Tigres">Artes Marciais / Tigres</option>
+                            <option value="Geral TS3">Geral TS3</option>
                         </select>
                     </div>
                     <button type="submit" class="btn btn-primary btn-sm w-100 fw-semibold">
@@ -1987,14 +2109,21 @@ MAIN_HTML = """
                     </div>
 
                     {% if session['role'] == 'admin' %}
-                    <div class="d-flex gap-2">
-                        <form method="POST" action="{{ url_for('sync_event_ts3', event_id=selected_event.id) }}">
-                            <button type="submit" class="btn btn-success fw-semibold">
-                                <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Presença do TS3 Agora
+                    <div class="d-flex flex-wrap align-items-center gap-2">
+                        <form method="POST" action="{{ url_for('sync_event_ts3', event_id=selected_event.id) }}" class="d-flex gap-2 align-items-center">
+                            <select name="filter_mode" class="form-select form-select-sm bg-dark text-warning fw-semibold border-secondary" style="width: auto;">
+                                <option value="all">Todas as Salas (Exceto AFK)</option>
+                                <option value="gvg_tw">Somente Salas de GVG + TW</option>
+                                <option value="gvg">Somente Salas de GVG (01 a 10)</option>
+                                <option value="tw">Somente Salas de TW (Ataque/Defesa)</option>
+                                <option value="eventos">Somente Eventos (Artes Marciais/Tigres)</option>
+                            </select>
+                            <button type="submit" class="btn btn-success btn-sm fw-semibold text-nowrap py-2 px-3">
+                                <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Presença TS3
                             </button>
                         </form>
                         <form method="POST" action="{{ url_for('delete_event', event_id=selected_event.id) }}" onsubmit="return confirm('Excluir este evento e todas as presenças dele?');">
-                            <button type="submit" class="btn btn-outline-danger">
+                            <button type="submit" class="btn btn-sm btn-outline-danger py-2">
                                 <i class="fa-solid fa-trash"></i>
                             </button>
                         </form>
@@ -2005,13 +2134,23 @@ MAIN_HTML = """
                 {% if session['role'] == 'admin' %}
                 <div class="mb-3">
                     <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#collapsePaste">
-                        <i class="fa-solid fa-paste me-1"></i> Contingência: Colar lista de Nicks do TS3 manualmente
+                        <i class="fa-solid fa-code me-1"></i> Contingência: Colar JSON da NeoTS ou Lista de Nicks
                     </button>
                     <div class="collapse mt-2" id="collapsePaste">
                         <form method="POST" action="{{ url_for('manual_paste_ts3', event_id=selected_event.id) }}" class="card card-body bg-dark border-secondary p-2">
-                            <small class="text-secondary mb-1">Se o host do seu TS3 estiver bloqueando conexão externa, cole aqui os nicks copiados da sala:</small>
-                            <textarea name="raw_nicks" rows="2" class="form-control form-control-sm bg-black text-light border-secondary mb-2"></textarea>
-                            <button type="submit" class="btn btn-sm btn-info align-self-end">Processar Nicks Colados (+1 TKP)</button>
+                            <small class="text-secondary mb-1">
+                                Você pode colar aqui tanto o código JSON da rota <code>viewer?_neots_action=view_channels</code> quanto uma lista de nicks:
+                            </small>
+                            <textarea name="raw_nicks" rows="3" class="form-control form-control-sm bg-black text-light border-secondary mb-2" placeholder='Cole aqui o JSON {"channels": ..., "clients": ...} ou os nicks um por linha'></textarea>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <select name="filter_mode" class="form-select form-select-sm bg-dark text-light border-secondary" style="width: 240px;">
+                                    <option value="all">Filtro: Todas as Salas (Exceto AFK)</option>
+                                    <option value="gvg_tw">Filtro: Somente Salas GVG + TW</option>
+                                    <option value="gvg">Filtro: Somente GVG</option>
+                                    <option value="tw">Filtro: Somente TW</option>
+                                </select>
+                                <button type="submit" class="btn btn-sm btn-info fw-bold">Processar & Contabilizar (+1 TKP)</button>
+                            </div>
                         </form>
                     </div>
                 </div>
@@ -2024,7 +2163,7 @@ MAIN_HTML = """
                                 <th>Login Player</th>
                                 <th>Nick Cadastrado (TS3)</th>
                                 <th>Status no Evento</th>
-                                <th>Nick Lido / Método</th>
+                                <th>Nick Lido / Sala no TS3</th>
                                 {% if session['role'] == 'admin' %}
                                 <th class="text-end">Ação Manual</th>
                                 {% endif %}
@@ -2045,7 +2184,9 @@ MAIN_HTML = """
                                 </td>
                                 <td class="small text-secondary">
                                     {% if att %}
-                                        <strong class="text-light">{{ att.ts_nick_found }}</strong> ({{ att.method }} às {{ att.checked_at }})
+                                        <strong class="text-light">{{ att.ts_nick_found }}</strong>
+                                        <span class="text-info">({{ att.method }})</span>
+                                        <span class="text-secondary" style="font-size:0.7rem;">às {{ att.checked_at }}</span>
                                     {% else %}
                                         —
                                     {% endif %}
@@ -2097,8 +2238,11 @@ MAIN_HTML = """
                         <input type="text" name="password" class="form-control form-control-sm bg-dark text-light border-secondary" required>
                     </div>
                     <div class="mb-2">
-                        <label class="form-label small text-secondary mb-1">Nick Exato no TeamSpeak 3</label>
-                        <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" required>
+                        <label class="form-label small text-secondary mb-1">Nick no TeamSpeak 3</label>
+                        <input type="text" name="ts_nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Sinister / GIGA / nikee" required>
+                        <div class="form-text text-secondary" style="font-size:0.7rem;">
+                            Reconhece automaticamente mesmo se tiver símbolos VIP ao lado do nick.
+                        </div>
                     </div>
                     <div class="row g-2 mb-3">
                         <div class="col-7">
@@ -2199,47 +2343,54 @@ MAIN_HTML = """
     {% endif %}
 
     <!-- ==========================================================
-         ABA 5: CONFIGURAR TS3
+         ABA 5: CONFIGURAR INTEGRAÇÃO NEO TEAMSPEAK (API CANAIS)
          ========================================================== -->
     {% if tab == 'tsconfig' and session['role'] == 'admin' %}
     <div class="row justify-content-center">
-        <div class="col-lg-7">
+        <div class="col-lg-8">
             <div class="card p-4">
-                <h5 class="fw-bold mb-1"><i class="fa-solid fa-server text-primary me-2"></i> Credenciais do Servidor TeamSpeak 3 (ServerQuery)</h5>
+                <h5 class="fw-bold mb-1">
+                    <i class="fa-solid fa-satellite-dish text-primary me-2"></i> Integração API NEO TEAMSPEAK (Estrutura de Canais)
+                </h5>
                 <p class="text-secondary small mb-4">
-                    Preencha os dados do seu servidor TS3 para puxar os nicks presentes nas salas em tempo real.
+                    Conecta direto na rota JSON da NEO TEAMSPEAK (serviço 383 - Arsenal PW) para ler todas as salas (GVG, TW, Eventos e Bate-Papo) sem depender da porta 10011.
                 </p>
 
                 <form method="POST" action="{{ url_for('save_tsconfig') }}">
-                    <div class="row g-3 mb-3">
-                        <div class="col-md-6">
-                            <label class="form-label small text-secondary">Endereço IP ou Domínio do TS3</label>
-                            <input type="text" name="host" value="{{ ts_cfg.host }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small text-secondary">Porta de Voz (UDP)</label>
-                            <input type="number" name="voice_port" value="{{ ts_cfg.voice_port }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
-                        <div class="col-md-3">
-                            <label class="form-label small text-secondary">Porta ServerQuery (TCP)</label>
-                            <input type="number" name="query_port" value="{{ ts_cfg.query_port }}" class="form-control bg-dark text-light border-secondary" required>
-                        </div>
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">URL da API de Canais da NEO TEAMSPEAK</label>
+                        <input type="text" name="neots_api_url" value="{{ ts_cfg.neots_api_url or 'https://neots.com.br/wp-json/neots/v1/service/383/viewer?_neots_action=view_channels&force=1' }}" class="form-control bg-dark text-info border-secondary" required>
                     </div>
 
                     <div class="row g-3 mb-3">
                         <div class="col-md-6">
-                            <label class="form-label small text-secondary">Usuário ServerQuery</label>
-                            <input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary">
+                            <label class="form-label small text-secondary">E-mail / Login do Painel NeoTS (Caso a API peça sessão)</label>
+                            <input type="text" name="query_user" value="{{ ts_cfg.query_user }}" class="form-control bg-dark text-light border-secondary" placeholder="Seu login no site neots.com.br">
                         </div>
                         <div class="col-md-6">
-                            <label class="form-label small text-secondary">Senha ServerQuery</label>
-                            <input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary">
+                            <label class="form-label small text-secondary">Senha do Painel NeoTS</label>
+                            <input type="password" name="query_pass" value="{{ ts_cfg.query_pass }}" class="form-control bg-dark text-light border-secondary" placeholder="Sua senha no site neots.com.br">
                         </div>
                     </div>
 
-                    <div class="mb-4">
-                        <label class="form-label small text-secondary">Ignorar Salas com estes Nomes (separados por vírgula)</label>
-                        <input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary">
+                    <div class="mb-3">
+                        <label class="form-label small text-secondary">Cookie da Sessão NeoTS (Opcional - somente se o site tiver proteção Cloudflare no login)</label>
+                        <input type="text" name="neots_cookie" value="{{ ts_cfg.neots_cookie or '' }}" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Opcional: wordpress_logged_in_... copiado do F12 > Network">
+                    </div>
+
+                    <div class="row g-3 mb-4">
+                        <div class="col-md-6">
+                            <label class="form-label small text-secondary">Ignorar Salas com estes Nomes (separados por vírgula)</label>
+                            <input type="text" name="ignore_channels" value="{{ ts_cfg.ignore_channels }}" class="form-control bg-dark text-light border-secondary" placeholder="AFK,Ausente">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-secondary">IP do TS3</label>
+                            <input type="text" name="host" value="{{ ts_cfg.host }}" class="form-control bg-dark text-secondary border-secondary">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-secondary">Porta de Voz</label>
+                            <input type="number" name="voice_port" value="{{ ts_cfg.voice_port }}" class="form-control bg-dark text-secondary border-secondary">
+                        </div>
                     </div>
 
                     <div class="d-flex gap-2">
@@ -2247,7 +2398,7 @@ MAIN_HTML = """
                             <i class="fa-solid fa-floppy-disk me-1"></i> Salvar Configurações
                         </button>
                         <button type="submit" name="action" value="test" class="btn btn-outline-info fw-semibold">
-                            <i class="fa-solid fa-plug-circle-check me-1"></i> Salvar e Testar Conexão Agora
+                            <i class="fa-solid fa-plug-circle-check me-1"></i> Salvar e Testar Leitura da API Agora
                         </button>
                     </div>
                 </form>
