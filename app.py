@@ -100,10 +100,16 @@ def safe_add_column(table_name, column_def):
     except Exception:
         pass
 
+def normalize_pw_class(cls_str):
+    c = (cls_str or "").strip().upper()
+    if c == "ESP":
+        return "PSY"
+    return c if c in PW_CLASSES else "WR"
+
 def init_db():
     id_col = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-    # 1. Usuários da Guild (com player_class, bonus_tkp, account_status e reset_status)
+    # 1. Usuários da Guild
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS users (
             id {id_col},
@@ -241,15 +247,18 @@ def init_db():
         )
     """)
 
-    # 9. Módulo Planilha de TW (PTs, Slots com Complemento/Piloto e Nicks Avulsos/Externos)
+    # 9. Módulo Planilha de TW (PTs com Posição ATAQUE ou DEFESA, Slots e Nicks Extras)
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS tw_parties (
             id {id_col},
             pt_name VARCHAR(120) NOT NULL,
             pt_function VARCHAR(150) DEFAULT '',
+            pt_side VARCHAR(30) DEFAULT 'ATAQUE',
             created_at VARCHAR(40)
         )
     """)
+    safe_add_column("tw_parties", "pt_side VARCHAR(30) DEFAULT 'ATAQUE'")
+    db_execute("UPDATE tw_parties SET pt_side = 'ATAQUE' WHERE pt_side IS NULL OR pt_side = ''")
 
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS tw_party_slots (
@@ -264,7 +273,6 @@ def init_db():
     """)
     safe_add_column("tw_party_slots", "pilot_nick VARCHAR(120) DEFAULT ''")
 
-    # Tabela para cadastrar Nicks Novos / Convidados / Líderes de Fora sem precisar criar login
     db_execute(f"""
         CREATE TABLE IF NOT EXISTS tw_extra_players (
             id {id_col},
@@ -292,7 +300,7 @@ def init_db():
                 it.get("updated_at") or datetime.now().strftime("%d/%m/%Y %H:%M")
             ))
 
-    cfg = db_execute("SELECT id FROM ts_config WHERE id = 1", fetchone=True)
+    cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
     if not cfg:
         db_execute("""
             INSERT INTO ts_config (id, host, voice_port, query_port, query_user, query_pass, ignore_channels, neots_api_url, neots_cookie)
@@ -452,7 +460,7 @@ def resolve_expired_auctions(force_auction_id=None):
             tied_ids_str = ",".join(str(b["user_id"]) for b in top_bidders)
             tied_names = ", ".join(b["username"] for b in top_bidders)
             new_round = rnd + 1
-            new_end_epoch = int(time.time()) + 360  # 6 minutos
+            new_end_epoch = int(time.time()) + 360
             new_end_str = datetime.fromtimestamp(new_end_epoch).strftime("%d/%m %H:%M:%S")
 
             db_execute("""
@@ -567,7 +575,6 @@ def parse_neots_json_payload(data, ignore_keywords, filter_mode="all"):
             "channel_path": full_path
         })
 
-    # Atualiza cache global de nicks online no TS3 para uso na Planilha de TW
     LAST_TS3_ONLINE_CACHE["nicks"] = [c["nick"] for c in online_clients]
     LAST_TS3_ONLINE_CACHE["updated_at"] = datetime.now().strftime("%H:%M:%S")
 
@@ -691,7 +698,7 @@ def admin_required(f):
     return decorated
 
 # ==========================================
-# ROTAS DE LOGIN, AUTO-CADASTRO (COM CLASSE) E RESET DE SENHA
+# ROTAS DE LOGIN, AUTO-CADASTRO E RESET DE SENHA
 # ==========================================
 @app.route("/api/check_user_login")
 def api_check_user_login():
@@ -754,7 +761,7 @@ def login():
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
                 session["ts_nick"] = user["ts_nick"]
-                session["player_class"] = user.get("player_class") or "WR"
+                session["player_class"] = normalize_pw_class(user.get("player_class"))
                 session["role"] = user["role"]
                 flash("✅ Nova senha criada com sucesso! Bem-vindo de volta.", "success")
                 return redirect(url_for("dashboard"))
@@ -768,7 +775,7 @@ def login():
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["ts_nick"] = user["ts_nick"]
-            session["player_class"] = user.get("player_class") or "WR"
+            session["player_class"] = normalize_pw_class(user.get("player_class"))
             session["role"] = user["role"]
             return redirect(url_for("dashboard"))
 
@@ -780,11 +787,8 @@ def login():
 def register_player():
     username = request.form.get("username", "").strip()
     ts_nick = request.form.get("ts_nick", "").strip()
-    player_class = request.form.get("player_class", "WR").strip().upper()
+    player_class = normalize_pw_class(request.form.get("player_class", "WR"))
     password = request.form.get("password", "").strip()
-
-    if player_class not in PW_CLASSES:
-        player_class = "WR"
 
     if not username or not ts_nick or not password:
         flash("Preencha Login, Nick do TS3, Classe e Senha para solicitar seu cadastro.", "warning")
@@ -852,6 +856,8 @@ def dashboard():
     resolve_expired_auctions()
 
     tab = request.args.get("tab", "estoque")
+    tw_view = request.args.get("tw_view", "planilha")  # 'planilha' (estilo Excel lado a lado) ou 'cards' (individual)
+    selected_pt_id = request.args.get("pt_id", type=int)
     selected_event_id = request.args.get("event_id", type=int)
 
     all_users = db_execute("SELECT * FROM users ORDER BY username ASC", fetch=True)
@@ -885,7 +891,6 @@ def dashboard():
     pending_users = []
     reset_requests = []
 
-    # Contabilizador de classes cadastradas (Guild + Nicks Extras TW)
     registered_class_counts = {c: 0 for c in PW_CLASSES}
     players_by_class = {c: [] for c in PW_CLASSES}
 
@@ -902,9 +907,7 @@ def dashboard():
         u["locked_tkp"] = w.get("locked_tkp", 0)
         u["tkp_balance"] = w.get("tkp_balance", 0)
         u["available_to_bid"] = w.get("available_to_bid", 0)
-        p_cls = (u.get("player_class") or "WR").upper()
-        if p_cls not in PW_CLASSES:
-            p_cls = "WR"
+        p_cls = normalize_pw_class(u.get("player_class"))
         u["player_class"] = p_cls
         u["is_online_ts"] = is_nick_online_in_cache(u["ts_nick"], online_ts3_nicks)
         u["is_extra"] = False
@@ -922,12 +925,10 @@ def dashboard():
         if rst_st == "solicitado":
             reset_requests.append(u)
 
-    # Busca Nicks Extras / Convidados / Líderes de Fora cadastrados na Planilha de TW
+    # Nicks Extras / Convidados / Líderes de Fora cadastrados na Planilha de TW
     tw_extra_players = db_execute("SELECT * FROM tw_extra_players ORDER BY nick ASC", fetch=True)
     for ex in tw_extra_players:
-        ex_cls = (ex.get("player_class") or "WR").upper()
-        if ex_cls not in PW_CLASSES:
-            ex_cls = "WR"
+        ex_cls = normalize_pw_class(ex.get("player_class"))
         ex["player_class"] = ex_cls
         ex["is_online_ts"] = is_nick_online_in_cache(ex["nick"], online_ts3_nicks)
         registered_class_counts[ex_cls] = registered_class_counts.get(ex_cls, 0) + 1
@@ -942,25 +943,31 @@ def dashboard():
 
     my_wallet = wallets.get(session["user_id"], {"tkp_balance": 0, "available_to_bid": 0, "locked_tkp": 0})
 
-    # Dados do Módulo Planilha de TW (PTs de até 10 vagas com Líder no Slot 1 + Complemento Quem vai Jogar)
+    # ==========================================================
+    # DADOS DO MÓDULO PLANILHA DE TW (ATAQUE vs DEFESA + CONTAGENS)
+    # ==========================================================
     tw_parties = db_execute("SELECT * FROM tw_parties ORDER BY id ASC", fetch=True)
     all_tw_slots = db_execute("SELECT * FROM tw_party_slots ORDER BY pt_id ASC, slot_number ASC", fetch=True)
 
     slots_by_pt = {}
+    for s in all_tw_slots:
+        slots_by_pt.setdefault(s["pt_id"], {})[int(s["slot_number"])] = s
+
     tw_assigned_class_counts = {c: 0 for c in PW_CLASSES}
+    tw_attack_class_counts = {c: 0 for c in PW_CLASSES}
+    tw_defense_class_counts = {c: 0 for c in PW_CLASSES}
     assigned_nicks_map = {}
 
-    for s in all_tw_slots:
-        pid = s["pt_id"]
-        slots_by_pt.setdefault(pid, {})[int(s["slot_number"])] = s
-        nick_val = (s.get("player_nick") or "").strip()
-        cls_val = (s.get("player_class") or "").strip().upper()
-        if nick_val:
-            if cls_val in tw_assigned_class_counts:
-                tw_assigned_class_counts[cls_val] += 1
+    attack_parties = []
+    defense_parties = []
 
     for pt in tw_parties:
         pid = pt["id"]
+        side = (pt.get("pt_side") or "ATAQUE").strip().upper()
+        if side not in ("ATAQUE", "DEFESA"):
+            side = "ATAQUE"
+        pt["pt_side"] = side
+
         pt_slots = []
         filled_count = 0
         for slot_num in range(1, 11):
@@ -972,19 +979,38 @@ def dashboard():
             })
             p_nick = (s_obj.get("player_nick") or "").strip()
             pil_nick = (s_obj.get("pilot_nick") or "").strip()
+            cls_val = normalize_pw_class(s_obj.get("player_class")) if p_nick and s_obj.get("player_class") else ""
+            s_obj["player_class"] = cls_val
+
             if p_nick:
                 filled_count += 1
-                assigned_nicks_map[p_nick.lower()] = pt["pt_name"]
+                assigned_nicks_map[p_nick.lower()] = f"{pt['pt_name']} ({side})"
+                if cls_val in PW_CLASSES:
+                    tw_assigned_class_counts[cls_val] += 1
+                    if side == "ATAQUE":
+                        tw_attack_class_counts[cls_val] += 1
+                    else:
+                        tw_defense_class_counts[cls_val] += 1
             if pil_nick:
-                assigned_nicks_map[pil_nick.lower()] = pt["pt_name"]
+                assigned_nicks_map[pil_nick.lower()] = f"{pt['pt_name']} ({side})"
 
             s_obj["is_online_ts"] = (
                 is_nick_online_in_cache(p_nick, online_ts3_nicks)
                 or is_nick_online_in_cache(pil_nick, online_ts3_nicks)
             )
             pt_slots.append(s_obj)
+
         pt["slots"] = pt_slots
         pt["filled_count"] = filled_count
+
+        if side == "DEFESA":
+            defense_parties.append(pt)
+        else:
+            attack_parties.append(pt)
+
+    total_attack_players = sum(tw_attack_class_counts.values())
+    total_defense_players = sum(tw_defense_class_counts.values())
+    total_tw_escalados = total_attack_players + total_defense_players
 
     for cls_key, plist in players_by_class.items():
         for pl in plist:
@@ -1054,6 +1080,8 @@ def dashboard():
     return render_template_string(
         MAIN_HTML,
         tab=tab,
+        tw_view=tw_view,
+        selected_pt_id=selected_pt_id,
         pw_classes=PW_CLASSES,
         users=active_users,
         tw_extra_players=tw_extra_players,
@@ -1063,8 +1091,15 @@ def dashboard():
         reset_requests=reset_requests,
         registered_class_counts=registered_class_counts,
         tw_assigned_class_counts=tw_assigned_class_counts,
+        tw_attack_class_counts=tw_attack_class_counts,
+        tw_defense_class_counts=tw_defense_class_counts,
+        total_attack_players=total_attack_players,
+        total_defense_players=total_defense_players,
+        total_tw_escalados=total_tw_escalados,
         players_by_class=players_by_class,
         tw_parties=tw_parties,
+        attack_parties=attack_parties,
+        defense_parties=defense_parties,
         my_wallet=my_wallet,
         events=events,
         selected_event=selected_event,
@@ -1080,18 +1115,14 @@ def dashboard():
     )
 
 # ==========================================
-# ROTAS DO MÓDULO PLANILHA DE TW (PTS + NICKS AVULSOS/EXTERNOS + PILOTOS + SYNC TS3)
+# ROTAS DO MÓDULO PLANILHA DE TW (MODELO EXCEL ATAQUE & DEFESA)
 # ==========================================
 @app.route("/tw/add_extra_player", methods=["POST"])
 @admin_required
 def add_tw_extra_player():
-    """Cadastra um nick novo (Líder de fora, Convidado ou Char adicional) direto para a Planilha de TW."""
     nick = request.form.get("nick", "").strip()
-    player_class = request.form.get("player_class", "WR").strip().upper()
+    player_class = normalize_pw_class(request.form.get("player_class", "WR"))
     pilot_note = request.form.get("pilot_note", "").strip()
-
-    if player_class not in PW_CLASSES:
-        player_class = "WR"
 
     if not nick:
         flash("Informe o Nick para incluir na listagem da TW.", "warning")
@@ -1112,19 +1143,18 @@ def add_tw_extra_player():
         )
         flash(f"Nick '{nick}' ({player_class}) cadastrado com sucesso para a Planilha de TW!", "success")
 
-    return redirect(url_for("dashboard", tab="tw"))
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
 
 @app.route("/tw/extra_player/<int:extra_id>/delete", methods=["POST"])
 @admin_required
 def delete_tw_extra_player(extra_id):
     db_execute("DELETE FROM tw_extra_players WHERE id = ?", (extra_id,))
     flash("Nick avulso removido da listagem.", "info")
-    return redirect(url_for("dashboard", tab="tw"))
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
 
 @app.route("/tw/sync_ts3_online", methods=["POST"])
 @admin_required
 def sync_tw_ts3_online():
-    """Atualiza a lista de quem está Online no TS3 agora para facilitar a montagem das PTs."""
     cfg = db_execute("SELECT * FROM ts_config WHERE id = 1", fetchone=True)
     ok, res = fetch_neots_api_clients(cfg, filter_mode="all")
     if ok:
@@ -1132,46 +1162,78 @@ def sync_tw_ts3_online():
         flash(f"Lista do TS3 sincronizada! {online_cnt} jogador(es) online disponíveis na seleção das PTs.", "success")
     else:
         flash(res, "danger")
-    return redirect(url_for("dashboard", tab="tw"))
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
+
+@app.route("/tw/seed_default_pts", methods=["POST"])
+@admin_required
+def seed_default_tw_pts():
+    """
+    Cria automaticamente as 12 PTs do modelo Excel caso ainda não existam:
+    - ATAQUE: CT, RECUPERAÇÃO, APOIO 1, APOIO 2, APOIO 3, APOIO 4
+    - DEFESA: KILL CT 1, KILL CT 2, BACKDEF 1, BACKDEF 2, BACKDEF 3, BACKDEF 4
+    """
+    default_structure = [
+        ("CT", "Catapulta Principal", "ATAQUE"),
+        ("RECUPERAÇÃO", "Recuperação / Apoio CT", "ATAQUE"),
+        ("APOIO 1", "Apoio Ataque 1", "ATAQUE"),
+        ("APOIO 2", "Apoio Ataque 2", "ATAQUE"),
+        ("APOIO 3", "Apoio Ataque 3", "ATAQUE"),
+        ("APOIO 4", "Apoio Ataque 4", "ATAQUE"),
+        ("KILL CT 1", "Anti-Catapulta 1", "DEFESA"),
+        ("KILL CT 2", "Anti-Catapulta 2", "DEFESA"),
+        ("BACKDEF 1", "Defesa Recuada 1", "DEFESA"),
+        ("BACKDEF 2", "Defesa Recuada 2", "DEFESA"),
+        ("BACKDEF 3", "Defesa Recuada 3", "DEFESA"),
+        ("BACKDEF 4", "Defesa Recuada 4", "DEFESA"),
+    ]
+    existing_pts = db_execute("SELECT pt_name, pt_side FROM tw_parties", fetch=True)
+    existing_keys = {(r["pt_name"].strip().upper(), (r.get("pt_side") or "ATAQUE").strip().upper()) for r in existing_pts}
+
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    added = 0
+    for name, func, side in default_structure:
+        if (name.upper(), side.upper()) not in existing_keys:
+            db_execute(
+                "INSERT INTO tw_parties (pt_name, pt_function, pt_side, created_at) VALUES (?, ?, ?, ?)",
+                (name, func, side, now_str)
+            )
+            added += 1
+
+    if added > 0:
+        flash(f"✅ {added} PTs padrão do Modelo Excel (Ataque & Defesa) foram criadas na planilha!", "success")
+    else:
+        flash("As PTs padrão do modelo já estão criadas na planilha.", "info")
+    return redirect(url_for("dashboard", tab="tw", tw_view="planilha"))
 
 @app.route("/tw/create_pt", methods=["POST"])
 @admin_required
 def create_tw_pt():
     pt_name = request.form.get("pt_name", "").strip()
     pt_function = request.form.get("pt_function", "").strip()
+    pt_side = request.form.get("pt_side", "ATAQUE").strip().upper()
+    if pt_side not in ("ATAQUE", "DEFESA"):
+        pt_side = "ATAQUE"
+
     if not pt_name:
-        flash("Informe o nome da PT (ex: PT 01).", "warning")
+        flash("Informe o nome da PT (ex: CT, APOIO 1, KILL CT 1).", "warning")
         return redirect(url_for("dashboard", tab="tw"))
 
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     db_execute(
-        "INSERT INTO tw_parties (pt_name, pt_function, created_at) VALUES (?, ?, ?)",
-        (pt_name, pt_function, now_str)
+        "INSERT INTO tw_parties (pt_name, pt_function, pt_side, created_at) VALUES (?, ?, ?, ?)",
+        (pt_name, pt_function, pt_side, now_str)
     )
-    flash(f"'{pt_name}' ({pt_function or 'Geral'}) criada na Planilha de TW!", "success")
-    return redirect(url_for("dashboard", tab="tw"))
+    flash(f"PT '{pt_name}' adicionada no bloco de {pt_side}!", "success")
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
 
-@app.route("/tw/<int:pt_id>/save", methods=["POST"])
-@admin_required
-def save_tw_pt(pt_id):
-    pt_name = request.form.get("pt_name", "").strip()
-    pt_function = request.form.get("pt_function", "").strip()
-    auto_register_new = request.form.get("auto_register_new") == "1"
-
-    if pt_name:
-        db_execute(
-            "UPDATE tw_parties SET pt_name = ?, pt_function = ? WHERE id = ?",
-            (pt_name, pt_function, pt_id)
-        )
-
-    # Mapeia nicks da Guild e Nicks Extras para autopreencher classe e saber quem já existe
+def build_nick_lookup_maps():
     active_users = db_execute("SELECT username, ts_nick, player_class FROM users", fetch=True)
     extra_users = db_execute("SELECT nick, player_class, pilot_note FROM tw_extra_players", fetch=True)
 
     nick_to_class = {}
     known_nicks = set()
     for u in active_users:
-        c = (u.get("player_class") or "WR").upper()
+        c = normalize_pw_class(u.get("player_class"))
         if u.get("ts_nick"):
             k = u["ts_nick"].strip().lower()
             nick_to_class[k] = c
@@ -1182,29 +1244,50 @@ def save_tw_pt(pt_id):
             known_nicks.add(k)
 
     for ex in extra_users:
-        c = (ex.get("player_class") or "WR").upper()
+        c = normalize_pw_class(ex.get("player_class"))
         if ex.get("nick"):
             k = ex["nick"].strip().lower()
             nick_to_class[k] = c
             known_nicks.add(k)
 
+    return nick_to_class, known_nicks
+
+@app.route("/tw/<int:pt_id>/save", methods=["POST"])
+@admin_required
+def save_tw_pt(pt_id):
+    pt_name = request.form.get("pt_name", "").strip()
+    pt_function = request.form.get("pt_function", "").strip()
+    pt_side = request.form.get("pt_side", "ATAQUE").strip().upper()
+    if pt_side not in ("ATAQUE", "DEFESA"):
+        pt_side = "ATAQUE"
+    auto_register_new = request.form.get("auto_register_new") == "1"
+
+    if pt_name:
+        db_execute(
+            "UPDATE tw_parties SET pt_name = ?, pt_function = ?, pt_side = ? WHERE id = ?",
+            (pt_name, pt_function, pt_side, pt_id)
+        )
+
+    nick_to_class, known_nicks = build_nick_lookup_maps()
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     new_nicks_created = 0
 
     for slot_num in range(1, 11):
         nick_val = request.form.get(f"nick_{slot_num}", "").strip()
         pilot_val = request.form.get(f"pilot_{slot_num}", "").strip()
-        class_val = request.form.get(f"class_{slot_num}", "").strip().upper()
+        raw_cls = request.form.get(f"class_{slot_num}", "").strip().upper()
 
-        if nick_val and not class_val:
-            class_val = nick_to_class.get(nick_val.lower(), "WR")
-        elif not nick_val:
+        if nick_val:
+            if raw_cls:
+                class_val = normalize_pw_class(raw_cls)
+            else:
+                class_val = nick_to_class.get(nick_val.lower(), "WR")
+        else:
             class_val = ""
 
-        # Se o Admin digitou um nick novo direto na PT e marcou para incluir na base da TW
         if nick_val and auto_register_new and nick_val.lower() not in known_nicks:
             cls_to_save = class_val if class_val in PW_CLASSES else "WR"
-            note_to_save = f"Piloto/Líder: {pilot_val}" if pilot_val else f"Criado na {pt_name}"
+            note_to_save = f"Piloto/Líder: {pilot_val}" if pilot_val else f"Escalado na {pt_name} ({pt_side})"
             try:
                 db_execute(
                     "INSERT INTO tw_extra_players (nick, player_class, pilot_note, created_at) VALUES (?, ?, ?, ?)",
@@ -1230,11 +1313,82 @@ def save_tw_pt(pt_id):
                 (pt_id, slot_num, nick_val, pilot_val, class_val)
             )
 
-    msg = f"Escalação da '{pt_name or 'PT'}' salva com sucesso!"
+    msg = f"PT '{pt_name}' ({pt_side}) atualizada com sucesso!"
     if new_nicks_created > 0:
-        msg += f" ({new_nicks_created} novo(s) nick(s) digitado(s) também foram incluídos no cadastro da TW!)."
+        msg += f" (+{new_nicks_created} novo(s) nick(s) incluído(s) na base)."
     flash(msg, "success")
-    return redirect(url_for("dashboard", tab="tw"))
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
+
+@app.route("/tw/save_matrix", methods=["POST"])
+@admin_required
+def save_tw_matrix():
+    """
+    Salva de uma só vez todas as PTs editadas lado a lado na Visão Planilha Completa (Ataque e Defesa).
+    """
+    tw_parties = db_execute("SELECT id, pt_name, pt_side FROM tw_parties", fetch=True)
+    nick_to_class, known_nicks = build_nick_lookup_maps()
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    new_nicks_created = 0
+
+    for pt in tw_parties:
+        pid = pt["id"]
+        new_name = request.form.get(f"pt_name_{pid}", "").strip() or pt["pt_name"]
+        new_func = request.form.get(f"pt_func_{pid}", "").strip()
+        new_side = request.form.get(f"pt_side_{pid}", pt.get("pt_side") or "ATAQUE").strip().upper()
+        if new_side not in ("ATAQUE", "DEFESA"):
+            new_side = "ATAQUE"
+
+        db_execute(
+            "UPDATE tw_parties SET pt_name = ?, pt_function = ?, pt_side = ? WHERE id = ?",
+            (new_name, new_func, new_side, pid)
+        )
+
+        for slot_num in range(1, 11):
+            nick_val = request.form.get(f"nick_{pid}_{slot_num}", "").strip()
+            pilot_val = request.form.get(f"pilot_{pid}_{slot_num}", "").strip()
+            raw_cls = request.form.get(f"class_{pid}_{slot_num}", "").strip().upper()
+
+            if nick_val:
+                if raw_cls:
+                    class_val = normalize_pw_class(raw_cls)
+                else:
+                    class_val = nick_to_class.get(nick_val.lower(), "WR")
+            else:
+                class_val = ""
+
+            if nick_val and nick_val.lower() not in known_nicks:
+                cls_to_save = class_val if class_val in PW_CLASSES else "WR"
+                note_to_save = f"Piloto/Líder: {pilot_val}" if pilot_val else f"Planilha {new_name} ({new_side})"
+                try:
+                    db_execute(
+                        "INSERT INTO tw_extra_players (nick, player_class, pilot_note, created_at) VALUES (?, ?, ?, ?)",
+                        (nick_val, cls_to_save, note_to_save, now_str)
+                    )
+                    known_nicks.add(nick_val.lower())
+                    new_nicks_created += 1
+                except Exception:
+                    pass
+
+            existing = db_execute(
+                "SELECT id FROM tw_party_slots WHERE pt_id = ? AND slot_number = ?",
+                (pid, slot_num), fetchone=True
+            )
+            if existing:
+                db_execute(
+                    "UPDATE tw_party_slots SET player_nick = ?, pilot_nick = ?, player_class = ? WHERE id = ?",
+                    (nick_val, pilot_val, class_val, existing["id"])
+                )
+            else:
+                db_execute(
+                    "INSERT INTO tw_party_slots (pt_id, slot_number, player_nick, pilot_nick, player_class) VALUES (?, ?, ?, ?, ?)",
+                    (pid, slot_num, nick_val, pilot_val, class_val)
+                )
+
+    msg = "✅ Planilha Completa de TW (Ataque & Defesa) salva com sucesso!"
+    if new_nicks_created > 0:
+        msg += f" ({new_nicks_created} novo(s) nick(s) cadastrado(s) automaticamente)."
+    flash(msg, "success")
+    return redirect(url_for("dashboard", tab="tw", tw_view="planilha"))
 
 @app.route("/tw/<int:pt_id>/delete", methods=["POST"])
 @admin_required
@@ -1242,7 +1396,7 @@ def delete_tw_pt(pt_id):
     db_execute("DELETE FROM tw_party_slots WHERE pt_id = ?", (pt_id,))
     db_execute("DELETE FROM tw_parties WHERE id = ?", (pt_id,))
     flash("PT removida da Planilha de TW.", "info")
-    return redirect(url_for("dashboard", tab="tw"))
+    return redirect(request.referrer or url_for("dashboard", tab="tw"))
 
 @app.route("/tw/export_csv")
 @login_required
@@ -1253,34 +1407,76 @@ def export_tw_csv():
     for s in all_tw_slots:
         slots_by_pt.setdefault(s["pt_id"], {})[int(s["slot_number"])] = s
 
+    attack_pts = [p for p in tw_parties if (p.get("pt_side") or "ATAQUE").upper() == "ATAQUE"]
+    defense_pts = [p for p in tw_parties if (p.get("pt_side") or "ATAQUE").upper() == "DEFESA"]
+
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output, delimiter=";")
 
-    writer.writerow(["PLANILHA DE TW - ESCALAÇÃO DE PTS, LÍDERES & PILOTOS"])
-    writer.writerow([])
-    writer.writerow(["PT", "Função da PT", "Posição", "Papel", "Nick / Char Principal", "Quem vai Jogar / Líder / Piloto (Complemento)", "Classe"])
+    def write_side_block(side_title, pts_list):
+        writer.writerow([f"=== BLOCO: {side_title} ==="])
+        if not pts_list:
+            writer.writerow(["Nenhuma PT cadastrada neste bloco."])
+            writer.writerow([])
+            return
 
-    for pt in tw_parties:
-        pid = pt["id"]
-        for slot_num in range(1, 11):
-            s = slots_by_pt.get(pid, {}).get(slot_num, {})
-            papel = "LÍDER DA PT" if slot_num == 1 else f"Membro {slot_num}"
-            writer.writerow([
-                pt["pt_name"],
-                pt.get("pt_function") or "",
-                slot_num,
-                papel,
-                s.get("player_nick") or "",
-                s.get("pilot_nick") or "",
-                s.get("player_class") or ""
-            ])
+        header_names = []
+        sub_headers = []
+        for p in pts_list:
+            label = f"{p['pt_name']} ({p['pt_function']})" if p.get("pt_function") else p["pt_name"]
+            header_names.extend([label, "", ""])
+            sub_headers.extend(["CLASSE", "NICK", "PILOTO/LÍDER"])
+        header_names.extend(["", f"QUANTIDADE {side_title}", ""])
+        sub_headers.extend(["", "CLASSE", "QUANTIDADE"])
+
+        writer.writerow(header_names)
+        writer.writerow(sub_headers)
+
+        side_cls_counts = {c: 0 for c in PW_CLASSES}
+        pt_totals = [0] * len(pts_list)
+
+        for idx, p in enumerate(pts_list):
+            for s_num in range(1, 11):
+                s = slots_by_pt.get(p["id"], {}).get(s_num, {})
+                nk = (s.get("player_nick") or "").strip()
+                cl = normalize_pw_class(s.get("player_class")) if nk and s.get("player_class") else ""
+                if nk:
+                    pt_totals[idx] += 1
+                    if cl in side_cls_counts:
+                        side_cls_counts[cl] += 1
+
+        for row_idx in range(10):
+            slot_num = row_idx + 1
+            row_cells = []
+            for p in pts_list:
+                s = slots_by_pt.get(p["id"], {}).get(slot_num, {})
+                row_cells.extend([
+                    s.get("player_class") or "",
+                    s.get("player_nick") or "",
+                    s.get("pilot_nick") or ""
+                ])
+            cls_name = PW_CLASSES[row_idx]
+            row_cells.extend(["", cls_name, side_cls_counts.get(cls_name, 0)])
+            writer.writerow(row_cells)
+
+        # Linha de Subtotal por PT e Total do Bloco
+        footer_cells = []
+        for tot in pt_totals:
+            footer_cells.extend(["TOTAL PT:", tot, ""])
+        footer_cells.extend(["", f"TOTAL {side_title}", sum(side_cls_counts.values())])
+        writer.writerow(footer_cells)
         writer.writerow([])
+
+    writer.writerow(["CONTROLE DE TW - PLANILHA OFICIAL (ATAQUE & DEFESA)"])
+    writer.writerow([])
+    write_side_block("ATAQUE", attack_pts)
+    write_side_block("DEFESA", defense_pts)
 
     return Response(
         output.getvalue(),
         mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=Planilha_TW_Arsenal.csv"}
+        headers={"Content-Disposition": "attachment; filename=Controle_TW_Ataque_Defesa.csv"}
     )
 
 # ==========================================
@@ -1319,10 +1515,9 @@ def cancel_password_reset(user_id):
 @app.route("/users/<int:user_id>/update_class", methods=["POST"])
 @admin_required
 def update_user_class(user_id):
-    new_cls = request.form.get("player_class", "WR").strip().upper()
-    if new_cls in PW_CLASSES:
-        db_execute("UPDATE users SET player_class = ? WHERE id = ?", (new_cls, user_id))
-        flash(f"Classe atualizada para {new_cls}!", "success")
+    new_cls = normalize_pw_class(request.form.get("player_class", "WR"))
+    db_execute("UPDATE users SET player_class = ? WHERE id = ?", (new_cls, user_id))
+    flash(f"Classe atualizada para {new_cls}!", "success")
     return redirect(request.referrer or url_for("dashboard", tab="players"))
 
 # ==========================================
@@ -1760,12 +1955,9 @@ def create_user():
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "").strip()
     ts_nick = request.form.get("ts_nick", "").strip()
-    player_class = request.form.get("player_class", "WR").strip().upper()
+    player_class = normalize_pw_class(request.form.get("player_class", "WR"))
     role = request.form.get("role", "player").strip()
     initial_tkp = int(request.form.get("bonus_tkp") or 0)
-
-    if player_class not in PW_CLASSES:
-        player_class = "WR"
 
     if not username or not password or not ts_nick:
         flash("Preencha Login, Senha, Classe e Nick do TS3.", "warning")
@@ -1816,7 +2008,7 @@ def delete_user(user_id):
 @login_required
 def update_profile():
     new_ts_nick = request.form.get("ts_nick", "").strip()
-    new_class = request.form.get("player_class", "").strip().upper()
+    new_class = normalize_pw_class(request.form.get("player_class", ""))
     new_pass = request.form.get("new_password", "").strip()
     uid = session["user_id"]
 
@@ -1929,7 +2121,7 @@ LOGIN_HTML = """
     <div class="login-card">
         <div class="brand-icon"><i class="fa-solid fa-headset"></i></div>
         <h4 class="text-center fw-bold mb-1">TS3 Guild Tracker</h4>
-        <p class="text-center text-secondary small mb-3">Presença TS3, Saque TKP & Planilha de TW</p>
+        <p class="text-center text-secondary small mb-3">Presença TS3, Saque TKP & Controle de TW</p>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
@@ -1939,7 +2131,6 @@ LOGIN_HTML = """
           {% endif %}
         {% endwith %}
 
-        <!-- ABAS: ENTRAR / CRIAR CONTA / RESET SENHA -->
         <ul class="nav nav-pills nav-fill gap-1 mb-4 bg-dark p-1 rounded-3 border border-secondary" role="tablist">
             <li class="nav-item" role="presentation">
                 <button class="nav-link active py-1" id="tab-login-btn" data-bs-toggle="pill" data-bs-target="#pane-login" type="button" role="tab">
@@ -2016,7 +2207,7 @@ LOGIN_HTML = """
                 </form>
             </div>
 
-            <!-- ABA 2: AUTO-CADASTRO DO PLAYER (COM LISTA SUSPENSA DE CLASSE) -->
+            <!-- ABA 2: AUTO-CADASTRO DO PLAYER -->
             <div class="tab-pane fade" id="pane-register" role="tabpanel">
                 <form method="POST" action="{{ url_for('register_player') }}">
                     <div class="alert alert-info py-2 px-3 small mb-3">
@@ -2137,7 +2328,7 @@ MAIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>TS3 Guild Tracker - Estoque, Saque TKP & Planilha TW</title>
+    <title>TS3 Guild Tracker - Estoque, Saque TKP & Controle de TW</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -2181,6 +2372,65 @@ MAIN_HTML = """
             border-radius: 8px;
             padding: 5px;
         }
+
+        /* Estilos da Visão Planilha Excel (CONTROLE DE TW) */
+        .tw-excel-banner-attack {
+            background: linear-gradient(90deg, #991b1b 0%, #dc2626 50%, #991b1b 100%);
+            color: #fff;
+            font-weight: 800;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 8px 14px;
+            border-radius: 8px 8px 0 0;
+            border: 1px solid #ef4444;
+        }
+        .tw-excel-banner-defense {
+            background: linear-gradient(90deg, #1e3a8a 0%, #2563eb 50%, #1e3a8a 100%);
+            color: #fff;
+            font-weight: 800;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            padding: 8px 14px;
+            border-radius: 8px 8px 0 0;
+            border: 1px solid #3b82f6;
+        }
+        .tw-matrix-col {
+            min-width: 225px;
+            max-width: 245px;
+            background: #0f1522;
+            border: 1px solid #2a364f;
+            border-radius: 8px;
+            flex: 0 0 auto;
+        }
+        .tw-matrix-header-attack {
+            background: #451a1c;
+            border-bottom: 2px solid #ef4444;
+            padding: 6px 8px;
+            border-radius: 7px 7px 0 0;
+        }
+        .tw-matrix-header-defense {
+            background: #172554;
+            border-bottom: 2px solid #3b82f6;
+            padding: 6px 8px;
+            border-radius: 7px 7px 0 0;
+        }
+        .tw-matrix-row-leader {
+            background: rgba(245, 158, 11, 0.16);
+            border-bottom: 1px solid rgba(245, 158, 11, 0.4);
+        }
+        .tw-matrix-footer {
+            background: #1a2234;
+            border-top: 2px solid #334155;
+            font-weight: 800;
+            padding: 6px;
+            text-align: center;
+            border-radius: 0 0 7px 7px;
+        }
+        .tw-qty-sidebar {
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 8px;
+        }
     </style>
 </head>
 <body>
@@ -2213,7 +2463,7 @@ MAIN_HTML = """
     </div>
 </nav>
 
-<div class="container pb-5">
+<div class="container-fluid px-3 px-lg-4 pb-5">
 
     <!-- CENTRAL DE APROVAÇÕES DO ADMIN -->
     {% if session['role'] == 'admin' and (pending_users or reset_requests) %}
@@ -2324,8 +2574,8 @@ MAIN_HTML = """
         </li>
         <li class="nav-item">
             <a class="nav-link {% if tab == 'tw' %}active{% endif %}" href="{{ url_for('dashboard', tab='tw') }}">
-                <i class="fa-solid fa-chess-rook me-1"></i> Planilha de TW (PTs & Classes)
-                <span class="badge bg-info text-dark ms-1">{{ tw_parties|length }} PTs</span>
+                <i class="fa-solid fa-chess-rook me-1"></i> Controle de TW (Ataque & Defesa)
+                <span class="badge bg-warning text-dark ms-1">{{ total_tw_escalados }} Escalados</span>
             </a>
         </li>
         <li class="nav-item">
@@ -2356,7 +2606,7 @@ MAIN_HTML = """
     </ul>
 
     <!-- ==========================================================
-         ABA PLANILHA DE TW (CLASSES + NICKS NOVOS/EXTERNOS + PILOTOS + ONLINE TS3)
+         ABA CONTROLE DE TW (MODELO EXCEL: ATAQUE & DEFESA + CONTAGENS + VISUALIZAR/EDITAR)
          ========================================================== -->
     {% if tab == 'tw' %}
 
@@ -2373,55 +2623,83 @@ MAIN_HTML = """
         {% endfor %}
     </datalist>
 
-    <!-- 1. PAINEL CONTABILIZADOR DE TODAS AS CLASSES (GUILD + EXTRAS) -->
-    <div class="card p-3 mb-4 border-primary">
-        <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
-            <div>
-                <h5 class="fw-bold mb-0">
-                    <i class="fa-solid fa-chart-pie text-info me-2"></i> Contabilizador Geral de Classes ({{ (users|length) + (tw_extra_players|length) }} Total: {{ users|length }} Guild + {{ tw_extra_players|length }} Extras/Fora)
-                </h5>
-                <small class="text-secondary">
-                    Online no TS3 sincronizados: <strong class="text-success">{{ online_ts3_nicks|length }}</strong> (Última leitura: {{ ts3_cache_time }})
-                </small>
+    <!-- 1. BARRA SUPERIOR: TOTAL GERAL DA TW + CONTABILIZADOR DE CLASSES + BOTÕES DE AÇÃO -->
+    <div class="card p-3 mb-3 border-primary">
+        <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-3">
+            <div class="d-flex align-items-center gap-3">
+                <div class="bg-warning text-dark rounded-3 px-3 py-2 text-center shadow-sm">
+                    <div class="small fw-bold text-uppercase" style="font-size: 0.68rem;">Total Escalado TW</div>
+                    <div class="fs-3 fw-black lh-1" id="grandTotalTwBadge">{{ total_tw_escalados }}</div>
+                </div>
+                <div>
+                    <h5 class="fw-bold mb-1">
+                        <i class="fa-solid fa-table-columns text-info me-1"></i> Controle de TW — Ataque & Defesa
+                    </h5>
+                    <div class="small text-secondary">
+                        <span class="badge bg-danger me-1">ATAQUE: <span id="topAttackTotal">{{ total_attack_players }}</span> ({{ attack_parties|length }} PTs)</span>
+                        <span class="badge bg-primary me-1">DEFESA: <span id="topDefenseTotal">{{ total_defense_players }}</span> ({{ defense_parties|length }} PTs)</span>
+                        <span class="badge bg-dark border border-secondary">Online TS3: <strong class="text-success">{{ online_ts3_nicks|length }}</strong> ({{ ts3_cache_time }})</span>
+                    </div>
+                </div>
             </div>
-            <div class="d-flex flex-wrap gap-2">
+
+            <!-- SELETOR DE MODO DE VISUALIZAÇÃO / EDIÇÃO E BOTÕES RÁPIDOS -->
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <div class="btn-group btn-group-sm" role="group">
+                    <a href="{{ url_for('dashboard', tab='tw', tw_view='planilha') }}"
+                       class="btn {% if tw_view == 'planilha' %}btn-primary fw-bold{% else %}btn-outline-secondary{% endif %}">
+                        <i class="fa-solid fa-table me-1"></i> Visão Planilha Geral (Ataque & Defesa)
+                    </a>
+                    <a href="{{ url_for('dashboard', tab='tw', tw_view='cards') }}"
+                       class="btn {% if tw_view == 'cards' %}btn-primary fw-bold{% else %}btn-outline-secondary{% endif %}">
+                        <i class="fa-solid fa-sliders me-1"></i> Visualizar / Editar PT Individual
+                    </a>
+                </div>
+
                 {% if session['role'] == 'admin' %}
+                <form method="POST" action="{{ url_for('seed_default_tw_pts') }}" class="d-inline">
+                    <button type="submit" class="btn btn-sm btn-outline-warning fw-semibold" title="Cria CT, RECUPERAÇÃO, APOIO 1..4 (Ataque) e KILL CT 1..2, BACKDEF 1..4 (Defesa)">
+                        <i class="fa-solid fa-wand-magic-sparkles me-1"></i> Gerar 12 PTs do Modelo Excel
+                    </button>
+                </form>
                 <form method="POST" action="{{ url_for('sync_tw_ts3_online') }}" class="d-inline">
                     <button type="submit" class="btn btn-sm btn-outline-success fw-semibold">
-                        <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Players Online do TS3
+                        <i class="fa-solid fa-satellite-dish me-1"></i> Puxar Online TS3
                     </button>
                 </form>
                 {% endif %}
+
                 <button class="btn btn-sm btn-outline-info" type="button" data-bs-toggle="collapse" data-bs-target="#collapsePlayersByClass">
-                    <i class="fa-solid fa-users-viewfinder me-1"></i> Ver Todos os Nicks por Classe
+                    <i class="fa-solid fa-users-viewfinder me-1"></i> Base de Contas ({{ (users|length) + (tw_extra_players|length) }})
                 </button>
                 <a href="{{ url_for('export_tw_csv') }}" class="btn btn-sm btn-success fw-semibold">
-                    <i class="fa-solid fa-file-excel me-1"></i> Baixar Planilha TW (.CSV)
+                    <i class="fa-solid fa-file-excel me-1"></i> Exportar Excel (.CSV)
                 </a>
             </div>
         </div>
 
+        <!-- RESUMO DE CLASSES CADASTRADAS VS ESCALADAS -->
         <div class="row g-2 text-center">
             {% for cls in pw_classes %}
             {% set cad_cnt = registered_class_counts.get(cls, 0) %}
             {% set esc_cnt = tw_assigned_class_counts.get(cls, 0) %}
             <div class="col-6 col-sm-4 col-md-3 col-lg">
                 <div class="p-2 rounded bg-dark border border-secondary h-100">
-                    <span class="badge cls-badge cls-{{ cls }} mb-1 fs-6">{{ cls }}</span>
-                    <div class="fw-bold fs-5 text-light">{{ cad_cnt }} <small class="text-secondary fw-normal" style="font-size:0.72rem;">disp.</small></div>
-                    <div class="small {% if esc_cnt > 0 %}text-warning fw-semibold{% else %}text-secondary{% endif %}" style="font-size:0.75rem;">
-                        Escalados: {{ esc_cnt }}
+                    <span class="badge cls-badge cls-{{ cls }} mb-1">{{ cls }}</span>
+                    <div class="fw-bold text-light">{{ cad_cnt }} <small class="text-secondary fw-normal" style="font-size:0.7rem;">base</small></div>
+                    <div class="small {% if esc_cnt > 0 %}text-warning fw-bold{% else %}text-secondary{% endif %}" style="font-size:0.72rem;">
+                        Escalados: <span class="live-total-cls-{{ cls }}">{{ esc_cnt }}</span>
                     </div>
                 </div>
             </div>
             {% endfor %}
         </div>
 
-        <!-- Gaveta expansível mostrando todos os players (Guild + Extras) por classe -->
+        <!-- Gaveta da Base de Contas por Classe -->
         <div class="collapse mt-3" id="collapsePlayersByClass">
             <div class="card card-body bg-black border-secondary p-3">
                 <h6 class="small fw-bold text-info mb-2">
-                    Nicks Disponíveis por Classe (🟢 = Online no TS3 | <span class="text-warning">[Extra]</span> = Cadastrado Avulso/Líder de Fora):
+                    Base de Contas por Classe (🟢 = Online no TS3 | Verde = Já Escalado em PT | Cinza = Disponível):
                 </h6>
                 <div class="row g-2">
                     {% for cls in pw_classes %}
@@ -2431,8 +2709,7 @@ MAIN_HTML = """
                             <strong class="small">({{ players_by_class[cls]|length }}):</strong>
                             <div class="mt-1 d-flex flex-wrap gap-1">
                                 {% for pl in players_by_class[cls] %}
-                                    <span class="badge {% if pl.assigned_pt %}bg-success{% else %}bg-secondary bg-opacity-50 text-light{% endif %}"
-                                          title="{% if pl.assigned_pt %}Escalado na {{ pl.assigned_pt }}{% else %}Disponível{% endif %}">
+                                    <span class="badge {% if pl.assigned_pt %}bg-success{% else %}bg-secondary bg-opacity-50 text-light{% endif %}">
                                         {% if pl.is_online_ts %}🟢 {% endif %}
                                         {{ pl.ts_nick }}
                                         {% if pl.is_extra %}<span class="text-warning">[Extra]</span>{% endif %}
@@ -2450,15 +2727,14 @@ MAIN_HTML = """
         </div>
     </div>
 
-    <!-- 2. PAINÉIS DO ADMIN: CADASTRAR NICK NOVO (AVULSO/LÍDER DE FORA) + CRIAR NOVA PT -->
+    <!-- 2. PAINEL DE INCLUSÃO RÁPIDA (NOVO NICK / CONVIDADO + CRIAR NOVA PT COM POSIÇÃO ATAQUE/DEFESA) -->
     {% if session['role'] == 'admin' %}
     <div class="row g-3 mb-4">
-        <!-- Card Esquerdo: Cadastrar Nick Novo / Líder de Fora / Convidado -->
         <div class="col-lg-6">
             <div class="card p-3 h-100 border-info">
-                <div class="d-flex justify-content-between align-items-center mb-2">
+                <div class="d-flex justify-content-between align-items-center mb-1">
                     <h6 class="fw-bold text-info mb-0">
-                        <i class="fa-solid fa-user-astronaut me-1"></i> Cadastrar Nick Novo / Líder de Fora / Convidado
+                        <i class="fa-solid fa-user-plus me-1"></i> Incluir Nick na Base da TW (Player / Firma / Líder de Fora)
                     </h6>
                     {% if tw_extra_players %}
                     <button class="btn btn-sm btn-outline-secondary py-0 px-2" type="button" data-bs-toggle="collapse" data-bs-target="#collapseExtraList">
@@ -2466,16 +2742,13 @@ MAIN_HTML = """
                     </button>
                     {% endif %}
                 </div>
-                <p class="text-secondary small mb-2">
-                    Inclua chares adicionais, líderes externos ou convidados sem precisar criar conta de login.
-                </p>
-                <form method="POST" action="{{ url_for('add_tw_extra_player') }}" class="row g-2 align-items-end">
+                <form method="POST" action="{{ url_for('add_tw_extra_player') }}" class="row g-2 align-items-end mt-1">
                     <div class="col-sm-4">
-                        <label class="small text-secondary" style="font-size:0.72rem;">Nick do Char / Líder</label>
-                        <input type="text" name="nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: LiderTop" required>
+                        <label class="small text-secondary" style="font-size:0.7rem;">Nick do Char</label>
+                        <input type="text" name="nick" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: nikeeMG" required>
                     </div>
                     <div class="col-sm-3">
-                        <label class="small text-warning fw-bold" style="font-size:0.72rem;">Classe</label>
+                        <label class="small text-warning fw-bold" style="font-size:0.7rem;">Classe</label>
                         <select name="player_class" class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary">
                             {% for cls in pw_classes %}
                             <option value="{{ cls }}">{{ cls }}</option>
@@ -2483,13 +2756,11 @@ MAIN_HTML = """
                         </select>
                     </div>
                     <div class="col-sm-3">
-                        <label class="small text-secondary" style="font-size:0.72rem;">Quem vai jogar (Opcional)</label>
-                        <input type="text" name="pilot_note" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: João (De fora)">
+                        <label class="small text-secondary" style="font-size:0.7rem;">Quem vai jogar (Opcional)</label>
+                        <input type="text" name="pilot_note" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Líder / Firma">
                     </div>
                     <div class="col-sm-2">
-                        <button type="submit" class="btn btn-info btn-sm w-100 fw-bold text-dark">
-                            + Incluir
-                        </button>
+                        <button type="submit" class="btn btn-info btn-sm w-100 fw-bold text-dark">+ Base</button>
                     </div>
                 </form>
 
@@ -2502,7 +2773,7 @@ MAIN_HTML = """
                             <strong>{{ ex.nick }}</strong>
                             {% if ex.pilot_note %}<small class="text-info">({{ ex.pilot_note }})</small>{% endif %}
                             <form method="POST" action="{{ url_for('delete_tw_extra_player', extra_id=ex.id) }}" class="d-inline ms-1">
-                                <button type="submit" class="btn btn-sm text-danger p-0 border-0" title="Remover"><i class="fa-solid fa-xmark"></i></button>
+                                <button type="submit" class="btn btn-sm text-danger p-0 border-0"><i class="fa-solid fa-xmark"></i></button>
                             </form>
                         </div>
                         {% endfor %}
@@ -2512,27 +2783,30 @@ MAIN_HTML = """
             </div>
         </div>
 
-        <!-- Card Direito: Criar Nova PT na Planilha -->
         <div class="col-lg-6">
             <div class="card p-3 h-100 border-warning">
                 <h6 class="fw-bold text-warning mb-1">
-                    <i class="fa-solid fa-flag me-1"></i> Criar Nova PT na Planilha de TW
+                    <i class="fa-solid fa-flag me-1"></i> Criar Nova PT (Escolher Posição: ATAQUE ou DEFESA)
                 </h6>
-                <p class="text-secondary small mb-2">
-                    Crie a PT com seu nome e função (até 10 vagas com o Líder na frente e campo opcional de quem vai jogar).
-                </p>
-                <form method="POST" action="{{ url_for('create_tw_pt') }}" class="row g-2 align-items-end">
-                    <div class="col-sm-4">
-                        <label class="small text-secondary" style="font-size:0.72rem;">Nome / Nº da PT</label>
-                        <input type="text" name="pt_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: PT 01 / PT 02" required>
-                    </div>
-                    <div class="col-sm-5">
-                        <label class="small text-secondary" style="font-size:0.72rem;">Função da PT</label>
-                        <input type="text" name="pt_function" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: CATAPULTA / ATAQUE AR / DEFESA">
+                <form method="POST" action="{{ url_for('create_tw_pt') }}" class="row g-2 align-items-end mt-1">
+                    <div class="col-sm-3">
+                        <label class="small text-warning fw-bold" style="font-size:0.7rem;">Posição na TW</label>
+                        <select name="pt_side" class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary">
+                            <option value="ATAQUE">⚔️ ATAQUE</option>
+                            <option value="DEFESA">🛡️ DEFESA</option>
+                        </select>
                     </div>
                     <div class="col-sm-3">
+                        <label class="small text-secondary" style="font-size:0.7rem;">Nome da PT</label>
+                        <input type="text" name="pt_name" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: CT / APOIO 1 / BACKDEF 1" required>
+                    </div>
+                    <div class="col-sm-4">
+                        <label class="small text-secondary" style="font-size:0.7rem;">Função / Detalhe</label>
+                        <input type="text" name="pt_function" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Ex: Catapulta / Anti-CT">
+                    </div>
+                    <div class="col-sm-2">
                         <button type="submit" class="btn btn-warning btn-sm w-100 fw-bold text-dark">
-                            <i class="fa-solid fa-plus-circle me-1"></i> Criar PT
+                            + Criar PT
                         </button>
                     </div>
                 </form>
@@ -2541,162 +2815,512 @@ MAIN_HTML = """
     </div>
     {% endif %}
 
-    <!-- 3. GRADE DE PTS DA PLANILHA DE TW (ATÉ 10 VAGAS: NICK PRINCIPAL + QUEM VAI JOGAR OPCIONAL + CLASSE) -->
-    <div class="row g-4">
-        {% for pt in tw_parties %}
-        <div class="col-lg-6">
-            <div class="card p-3 h-100 border-secondary">
-                {% if session['role'] == 'admin' %}
-                <form method="POST" action="{{ url_for('save_tw_pt', pt_id=pt.id) }}">
-                    <div class="d-flex justify-content-between align-items-center border-bottom border-secondary pb-2 mb-2 gap-2">
-                        <div class="d-flex gap-2 flex-grow-1">
-                            <input type="text" name="pt_name" value="{{ pt.pt_name }}" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" style="max-width: 130px;" placeholder="Nome da PT" required>
-                            <input type="text" name="pt_function" value="{{ pt.pt_function }}" class="form-control form-control-sm bg-dark text-info fw-semibold border-secondary" placeholder="Função (Ex: Catapulta / Defesa)">
-                        </div>
-                        <span class="badge bg-dark border border-secondary">{{ pt.filled_count }}/10</span>
-                    </div>
+    <!-- ==========================================================
+         MODO 1: VISÃO PLANILHA COMPLETA LADO A LADO (IGUAL AO EXCEL: ATAQUE & DEFESA + TABELAS DE QUANTIDADE)
+         ========================================================== -->
+    {% if tw_view == 'planilha' %}
+        {% if tw_parties %}
+        <form method="POST" action="{{ url_for('save_tw_matrix') }}" id="twMatrixForm">
 
-                    <div class="row g-1 px-1 mb-1 text-secondary" style="font-size: 0.7rem; text-transform: uppercase;">
-                        <div class="col-2">Vaga</div>
-                        <div class="col-4">Nick (Guild / On / Novo)</div>
-                        <div class="col-4">Quem vai Jogar (Opcional)</div>
-                        <div class="col-2">Classe</div>
-                    </div>
+            {% if session['role'] == 'admin' %}
+            <div class="d-flex flex-wrap justify-content-between align-items-center bg-dark border border-success rounded-3 p-2 px-3 mb-3">
+                <div class="small text-light">
+                    <i class="fa-solid fa-pen-to-square text-success me-1"></i>
+                    <strong>Edição Direta na Planilha Ativa:</strong> Digite ou escolha o <strong>NICK</strong> em qualquer coluna — a <strong>CLASSE</strong> e as tabelas de <strong>QUANTIDADE ATAQUE / DEFESA</strong> atualizam sozinhas na hora!
+                </div>
+                <button type="submit" class="btn btn-success btn-sm fw-bold px-4">
+                    <i class="fa-solid fa-floppy-disk me-1"></i> Salvar Toda a Planilha de TW
+                </button>
+            </div>
+            {% endif %}
 
-                    <!-- LISTA DOS 10 SLOTS DA PT -->
-                    <div class="d-flex flex-column gap-2 mb-3">
-                        {% for s in pt.slots %}
-                        {% set is_ldr = (s.slot_number == 1) %}
-                        <div class="row g-1 align-items-center {% if is_ldr %}leader-slot-row{% else %}member-slot-row{% endif %}">
-                            <div class="col-2">
-                                {% if is_ldr %}
-                                    <span class="badge bg-warning text-dark fw-bold w-100 py-1" style="font-size:0.7rem;" title="Líder da PT">
-                                        👑 LÍDER
-                                    </span>
-                                {% else %}
-                                    <span class="badge bg-dark border border-secondary text-secondary w-100 py-1" style="font-size:0.7rem;">
-                                        #{{ s.slot_number }}
-                                        {% if s.is_online_ts %}<span class="text-success ms-1" title="Online no TS3">●</span>{% endif %}
-                                    </span>
-                                {% endif %}
-                            </div>
-                            <div class="col-4">
-                                <input type="text"
-                                       name="nick_{{ s.slot_number }}"
-                                       value="{{ s.player_nick }}"
-                                       list="allTwPlayersDatalist"
-                                       oninput="autoFillTwSlot(this, 'pilotInput_{{ pt.id }}_{{ s.slot_number }}', 'classSelect_{{ pt.id }}_{{ s.slot_number }}')"
-                                       class="form-control form-control-sm bg-dark {% if is_ldr %}text-warning fw-bold border-warning{% else %}text-light border-secondary{% endif %}"
-                                       placeholder="{% if is_ldr %}Nick Líder...{% else %}Nick / On...{% endif %}">
-                            </div>
-                            <div class="col-4">
-                                <input type="text"
-                                       name="pilot_{{ s.slot_number }}"
-                                       id="pilotInput_{{ pt.id }}_{{ s.slot_number }}"
-                                       value="{{ s.pilot_nick or '' }}"
-                                       list="allTwPlayersDatalist"
-                                       class="form-control form-control-sm bg-black text-info border-secondary"
-                                       placeholder="Opcional: Piloto/Líder...">
-                            </div>
-                            <div class="col-2">
-                                <select name="class_{{ s.slot_number }}"
-                                        id="classSelect_{{ pt.id }}_{{ s.slot_number }}"
-                                        class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary px-1">
-                                    <option value="">--</option>
-                                    {% for cls in pw_classes %}
-                                    <option value="{{ cls }}" {% if s.player_class == cls %}selected{% endif %}>{{ cls }}</option>
+            <!-- ==========================================
+                 BLOCO 1 DA PLANILHA: ATAQUE + QUANTIDADE ATAQUE
+                 ========================================== -->
+            <div class="mb-4">
+                <div class="tw-excel-banner-attack d-flex justify-content-between align-items-center">
+                    <span><i class="fa-solid fa-burst me-2"></i> BLOCO DE ATAQUE ({{ attack_parties|length }} PTs)</span>
+                    <span class="badge bg-black text-warning fs-6">TOTAL ATAQUE: <span id="bannerAttackTotal">{{ total_attack_players }}</span></span>
+                </div>
+                <div class="card rounded-top-0 border-danger p-3">
+                    <div class="row g-3">
+                        <!-- Colunas das PTs de ATAQUE Lado a Lado -->
+                        <div class="col-xl-9 col-lg-8">
+                            {% if attack_parties %}
+                            <div class="d-flex gap-2 overflow-auto pb-2">
+                                {% for pt in attack_parties %}
+                                <div class="tw-matrix-col" data-pt-id="{{ pt.id }}" data-pt-side="ATAQUE">
+                                    <div class="tw-matrix-header-attack">
+                                        {% if session['role'] == 'admin' %}
+                                        <div class="d-flex justify-content-between align-items-center gap-1 mb-1">
+                                            <input type="text" name="pt_name_{{ pt.id }}" value="{{ pt.pt_name }}"
+                                                   class="form-control form-control-sm bg-black text-warning fw-bold border-secondary py-0 px-1"
+                                                   style="font-size:0.8rem;" required>
+                                            <select name="pt_side_{{ pt.id }}" class="form-select form-select-sm bg-black text-light border-secondary py-0 px-1" style="width:82px; font-size:0.7rem;" title="Mover para Ataque ou Defesa">
+                                                <option value="ATAQUE" selected>ATAQUE</option>
+                                                <option value="DEFESA">DEFESA</option>
+                                            </select>
+                                            <a href="{{ url_for('dashboard', tab='tw', tw_view='cards', pt_id=pt.id) }}" class="btn btn-sm btn-outline-light py-0 px-1" title="Abrir PT isolada">
+                                                <i class="fa-solid fa-up-right-from-square" style="font-size:0.7rem;"></i>
+                                            </a>
+                                        </div>
+                                        <input type="text" name="pt_func_{{ pt.id }}" value="{{ pt.pt_function }}"
+                                               class="form-control form-control-sm bg-dark text-info border-0 py-0 px-1"
+                                               style="font-size:0.7rem;" placeholder="Função da PT...">
+                                        {% else %}
+                                        <div class="fw-bold text-warning text-center">{{ pt.pt_name }}</div>
+                                        <div class="small text-info text-center" style="font-size:0.72rem;">{{ pt.pt_function or 'Ataque' }}</div>
+                                        {% endif %}
+                                    </div>
+
+                                    <!-- Subcabeçalho CLASSE | NICK igual ao Excel -->
+                                    <div class="d-flex bg-black text-secondary fw-bold border-bottom border-secondary px-2 py-1" style="font-size:0.68rem;">
+                                        <div style="width: 68px;">CLASSE</div>
+                                        <div class="flex-grow-1">NICK (1º = LÍDER)</div>
+                                    </div>
+
+                                    <!-- 10 Linhas da PT -->
+                                    {% for s in pt.slots %}
+                                    {% set is_ldr = (s.slot_number == 1) %}
+                                    <div class="p-1 border-bottom border-secondary {% if is_ldr %}tw-matrix-row-leader{% endif %}">
+                                        {% if session['role'] == 'admin' %}
+                                        <div class="d-flex align-items-center gap-1">
+                                            <select name="class_{{ pt.id }}_{{ s.slot_number }}"
+                                                    id="mClass_{{ pt.id }}_{{ s.slot_number }}"
+                                                    onchange="recalcTwMatrix()"
+                                                    class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary py-0 px-1 matrix-cls-select"
+                                                    data-side="ATAQUE"
+                                                    data-pt-id="{{ pt.id }}"
+                                                    style="width: 66px; font-size:0.74rem;">
+                                                <option value="">--</option>
+                                                {% for cls in pw_classes %}
+                                                <option value="{{ cls }}" {% if s.player_class == cls %}selected{% endif %}>{{ cls }}</option>
+                                                {% endfor %}
+                                            </select>
+                                            <div class="flex-grow-1 position-relative">
+                                                <input type="text"
+                                                       name="nick_{{ pt.id }}_{{ s.slot_number }}"
+                                                       id="mNick_{{ pt.id }}_{{ s.slot_number }}"
+                                                       value="{{ s.player_nick }}"
+                                                       list="allTwPlayersDatalist"
+                                                       oninput="onMatrixNickInput(this, 'mClass_{{ pt.id }}_{{ s.slot_number }}', 'mPilot_{{ pt.id }}_{{ s.slot_number }}')"
+                                                       class="form-control form-control-sm bg-dark {% if is_ldr %}text-warning fw-bold border-warning{% else %}text-light border-secondary{% endif %} py-0 px-1 matrix-nick-input"
+                                                       data-side="ATAQUE"
+                                                       data-pt-id="{{ pt.id }}"
+                                                       style="font-size:0.78rem;"
+                                                       placeholder="{% if is_ldr %}👑 Líder...{% else %}{{ s.slot_number }}. Nick...{% endif %}">
+                                            </div>
+                                        </div>
+                                        <input type="text"
+                                               name="pilot_{{ pt.id }}_{{ s.slot_number }}"
+                                               id="mPilot_{{ pt.id }}_{{ s.slot_number }}"
+                                               value="{{ s.pilot_nick or '' }}"
+                                               class="form-control form-control-sm bg-black text-info border-0 py-0 px-1 mt-1"
+                                               style="font-size:0.68rem;"
+                                               placeholder="Opcional: Quem vai jogar...">
+                                        {% else %}
+                                        <div class="d-flex align-items-center justify-content-between px-1 py-1">
+                                            <span class="badge cls-badge cls-{{ s.player_class }}" style="font-size:0.68rem;">{{ s.player_class or '—' }}</span>
+                                            <div class="text-truncate ms-2 flex-grow-1 {% if is_ldr %}fw-bold text-warning{% else %}small{% endif %}">
+                                                {% if is_ldr %}👑 {% endif %}
+                                                {% if s.is_online_ts %}<span class="text-success">●</span> {% endif %}
+                                                {{ s.player_nick or '—' }}
+                                                {% if s.pilot_nick %}<small class="text-info d-block" style="font-size:0.65rem;">({{ s.pilot_nick }})</small>{% endif %}
+                                            </div>
+                                        </div>
+                                        {% endif %}
+                                    </div>
                                     {% endfor %}
-                                </select>
+
+                                    <!-- Rodapé com Contagem da PT (Igual à linha 19 do Excel) -->
+                                    <div class="tw-matrix-footer text-warning">
+                                        TOTAL PT: <span id="ptCount_{{ pt.id }}" class="fs-6">{{ pt.filled_count }}</span> / 10
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <div class="text-center text-secondary py-4">
+                                Nenhuma PT de <strong>ATAQUE</strong> criada ainda. Crie acima ou clique em <strong>Gerar 12 PTs do Modelo Excel</strong>.
+                            </div>
+                            {% endif %}
+                        </div>
+
+                        <!-- Tabela Lateral Direita: QUANTIDADE ATAQUE (Igual às colunas O e P do Excel) -->
+                        <div class="col-xl-3 col-lg-4">
+                            <div class="tw-qty-sidebar p-2 h-100">
+                                <div class="bg-danger text-white fw-bold text-center py-1 rounded mb-2" style="font-size:0.82rem;">
+                                    QUANTIDADE ATAQUE
+                                </div>
+                                <table class="table table-dark table-sm table-bordered border-secondary align-middle mb-0 text-center">
+                                    <thead>
+                                        <tr class="text-secondary" style="font-size:0.72rem;">
+                                            <th>CLASSE</th>
+                                            <th>QUANTIDADE</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for cls in pw_classes %}
+                                        <tr>
+                                            <td><span class="badge cls-badge cls-{{ cls }}">{{ cls }}</span></td>
+                                            <td class="fw-bold fs-6" id="qtyAttack_{{ cls }}">{{ tw_attack_class_counts.get(cls, 0) }}</td>
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                    <tfoot>
+                                        <tr class="table-warning text-dark fw-black">
+                                            <td>TOTAL</td>
+                                            <td class="fs-5" id="qtyAttackTotal">{{ total_attack_players }}</td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
                             </div>
                         </div>
-                        {% endfor %}
                     </div>
-
-                    <div class="d-flex flex-wrap justify-content-between align-items-center pt-2 border-top border-secondary gap-2">
-                        <div class="form-check small text-secondary mb-0">
-                            <input class="form-check-input" type="checkbox" name="auto_register_new" value="1" id="autoReg{{ pt.id }}" checked>
-                            <label class="form-check-label" for="autoReg{{ pt.id }}" style="font-size: 0.75rem;">
-                                Cadastrar automaticamente se eu digitar um nick novo
-                            </label>
-                        </div>
-                        <div class="d-flex gap-2">
-                            <button type="submit" class="btn btn-sm btn-success fw-bold px-3">
-                                <i class="fa-solid fa-floppy-disk me-1"></i> Salvar {{ pt.pt_name }}
-                            </button>
-                            <button type="submit" form="deletePtForm{{ pt.id }}" class="btn btn-sm btn-outline-danger py-0 px-2" title="Excluir esta PT">
-                                <i class="fa-solid fa-trash"></i>
-                            </button>
-                        </div>
-                    </div>
-                </form>
-                <form id="deletePtForm{{ pt.id }}" method="POST" action="{{ url_for('delete_tw_pt', pt_id=pt.id) }}" onsubmit="return confirm('Excluir a {{ pt.pt_name }} da planilha?');"></form>
-
-                {% else %}
-                <!-- VISUALIZAÇÃO PARA PLAYERS COMUNS -->
-                <div class="d-flex justify-content-between align-items-center border-bottom border-secondary pb-2 mb-3">
-                    <div>
-                        <span class="fs-5 fw-bold text-warning">{{ pt.pt_name }}</span>
-                        {% if pt.pt_function %}
-                            <span class="badge bg-info text-dark ms-2">{{ pt.pt_function }}</span>
-                        {% endif %}
-                    </div>
-                    <span class="badge bg-secondary">{{ pt.filled_count }}/10 Escalados</span>
                 </div>
-
-                <div class="table-responsive">
-                    <table class="table table-dark table-sm align-middle mb-0">
-                        <thead>
-                            <tr class="text-secondary small">
-                                <th style="width: 22%;">Vaga</th>
-                                <th>Nick / Char</th>
-                                <th>Quem vai Jogar / Complemento</th>
-                                <th class="text-end">Classe</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for s in pt.slots %}
-                            <tr>
-                                <td>
-                                    {% if s.slot_number == 1 %}
-                                        <span class="badge bg-warning text-dark fw-bold"><i class="fa-solid fa-crown me-1"></i>1. LÍDER</span>
-                                    {% else %}
-                                        <span class="small text-secondary">{{ s.slot_number }}. Membro</span>
-                                    {% endif %}
-                                </td>
-                                <td class="{% if s.slot_number == 1 %}fw-bold text-warning{% endif %}">
-                                    {% if s.is_online_ts %}<span class="text-success me-1" title="Online no TS3">●</span>{% endif %}
-                                    {{ s.player_nick or '— Vago —' }}
-                                </td>
-                                <td class="small text-info">
-                                    {{ s.pilot_nick or '—' }}
-                                </td>
-                                <td class="text-end">
-                                    {% if s.player_class %}
-                                        <span class="badge cls-badge cls-{{ s.player_class }}">{{ s.player_class }}</span>
-                                    {% else %}
-                                        —
-                                    {% endif %}
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-                {% endif %}
             </div>
-        </div>
+
+            <!-- ==========================================
+                 BLOCO 2 DA PLANILHA: DEFESA + QUANTIDADE DEFESA
+                 ========================================== -->
+            <div class="mb-4">
+                <div class="tw-excel-banner-defense d-flex justify-content-between align-items-center">
+                    <span><i class="fa-solid fa-shield-halved me-2"></i> BLOCO DE DEFESA ({{ defense_parties|length }} PTs)</span>
+                    <span class="badge bg-black text-info fs-6">TOTAL DEFESA: <span id="bannerDefenseTotal">{{ total_defense_players }}</span></span>
+                </div>
+                <div class="card rounded-top-0 border-primary p-3">
+                    <div class="row g-3">
+                        <!-- Colunas das PTs de DEFESA Lado a Lado -->
+                        <div class="col-xl-9 col-lg-8">
+                            {% if defense_parties %}
+                            <div class="d-flex gap-2 overflow-auto pb-2">
+                                {% for pt in defense_parties %}
+                                <div class="tw-matrix-col" data-pt-id="{{ pt.id }}" data-pt-side="DEFESA">
+                                    <div class="tw-matrix-header-defense">
+                                        {% if session['role'] == 'admin' %}
+                                        <div class="d-flex justify-content-between align-items-center gap-1 mb-1">
+                                            <input type="text" name="pt_name_{{ pt.id }}" value="{{ pt.pt_name }}"
+                                                   class="form-control form-control-sm bg-black text-warning fw-bold border-secondary py-0 px-1"
+                                                   style="font-size:0.8rem;" required>
+                                            <select name="pt_side_{{ pt.id }}" class="form-select form-select-sm bg-black text-light border-secondary py-0 px-1" style="width:82px; font-size:0.7rem;" title="Mover para Ataque ou Defesa">
+                                                <option value="ATAQUE">ATAQUE</option>
+                                                <option value="DEFESA" selected>DEFESA</option>
+                                            </select>
+                                            <a href="{{ url_for('dashboard', tab='tw', tw_view='cards', pt_id=pt.id) }}" class="btn btn-sm btn-outline-light py-0 px-1" title="Abrir PT isolada">
+                                                <i class="fa-solid fa-up-right-from-square" style="font-size:0.7rem;"></i>
+                                            </a>
+                                        </div>
+                                        <input type="text" name="pt_func_{{ pt.id }}" value="{{ pt.pt_function }}"
+                                               class="form-control form-control-sm bg-dark text-info border-0 py-0 px-1"
+                                               style="font-size:0.7rem;" placeholder="Função da PT...">
+                                        {% else %}
+                                        <div class="fw-bold text-warning text-center">{{ pt.pt_name }}</div>
+                                        <div class="small text-info text-center" style="font-size:0.72rem;">{{ pt.pt_function or 'Defesa' }}</div>
+                                        {% endif %}
+                                    </div>
+
+                                    <div class="d-flex bg-black text-secondary fw-bold border-bottom border-secondary px-2 py-1" style="font-size:0.68rem;">
+                                        <div style="width: 68px;">CLASSE</div>
+                                        <div class="flex-grow-1">NICK (1º = LÍDER)</div>
+                                    </div>
+
+                                    {% for s in pt.slots %}
+                                    {% set is_ldr = (s.slot_number == 1) %}
+                                    <div class="p-1 border-bottom border-secondary {% if is_ldr %}tw-matrix-row-leader{% endif %}">
+                                        {% if session['role'] == 'admin' %}
+                                        <div class="d-flex align-items-center gap-1">
+                                            <select name="class_{{ pt.id }}_{{ s.slot_number }}"
+                                                    id="mClass_{{ pt.id }}_{{ s.slot_number }}"
+                                                    onchange="recalcTwMatrix()"
+                                                    class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary py-0 px-1 matrix-cls-select"
+                                                    data-side="DEFESA"
+                                                    data-pt-id="{{ pt.id }}"
+                                                    style="width: 66px; font-size:0.74rem;">
+                                                <option value="">--</option>
+                                                {% for cls in pw_classes %}
+                                                <option value="{{ cls }}" {% if s.player_class == cls %}selected{% endif %}>{{ cls }}</option>
+                                                {% endfor %}
+                                            </select>
+                                            <div class="flex-grow-1">
+                                                <input type="text"
+                                                       name="nick_{{ pt.id }}_{{ s.slot_number }}"
+                                                       id="mNick_{{ pt.id }}_{{ s.slot_number }}"
+                                                       value="{{ s.player_nick }}"
+                                                       list="allTwPlayersDatalist"
+                                                       oninput="onMatrixNickInput(this, 'mClass_{{ pt.id }}_{{ s.slot_number }}', 'mPilot_{{ pt.id }}_{{ s.slot_number }}')"
+                                                       class="form-control form-control-sm bg-dark {% if is_ldr %}text-warning fw-bold border-warning{% else %}text-light border-secondary{% endif %} py-0 px-1 matrix-nick-input"
+                                                       data-side="DEFESA"
+                                                       data-pt-id="{{ pt.id }}"
+                                                       style="font-size:0.78rem;"
+                                                       placeholder="{% if is_ldr %}👑 Líder...{% else %}{{ s.slot_number }}. Nick...{% endif %}">
+                                            </div>
+                                        </div>
+                                        <input type="text"
+                                               name="pilot_{{ pt.id }}_{{ s.slot_number }}"
+                                               id="mPilot_{{ pt.id }}_{{ s.slot_number }}"
+                                               value="{{ s.pilot_nick or '' }}"
+                                               class="form-control form-control-sm bg-black text-info border-0 py-0 px-1 mt-1"
+                                               style="font-size:0.68rem;"
+                                               placeholder="Opcional: Quem vai jogar...">
+                                        {% else %}
+                                        <div class="d-flex align-items-center justify-content-between px-1 py-1">
+                                            <span class="badge cls-badge cls-{{ s.player_class }}" style="font-size:0.68rem;">{{ s.player_class or '—' }}</span>
+                                            <div class="text-truncate ms-2 flex-grow-1 {% if is_ldr %}fw-bold text-warning{% else %}small{% endif %}">
+                                                {% if is_ldr %}👑 {% endif %}
+                                                {% if s.is_online_ts %}<span class="text-success">●</span> {% endif %}
+                                                {{ s.player_nick or '—' }}
+                                                {% if s.pilot_nick %}<small class="text-info d-block" style="font-size:0.65rem;">({{ s.pilot_nick }})</small>{% endif %}
+                                            </div>
+                                        </div>
+                                        {% endif %}
+                                    </div>
+                                    {% endfor %}
+
+                                    <div class="tw-matrix-footer text-info">
+                                        TOTAL PT: <span id="ptCount_{{ pt.id }}" class="fs-6">{{ pt.filled_count }}</span> / 10
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <div class="text-center text-secondary py-4">
+                                Nenhuma PT de <strong>DEFESA</strong> criada ainda. Crie acima escolhendo <strong>🛡️ DEFESA</strong> ou clique em <strong>Gerar 12 PTs do Modelo Excel</strong>.
+                            </div>
+                            {% endif %}
+                        </div>
+
+                        <!-- Tabela Lateral Direita: QUANTIDADE DEFESA (Igual às colunas O e P do Excel) -->
+                        <div class="col-xl-3 col-lg-4">
+                            <div class="tw-qty-sidebar p-2 h-100">
+                                <div class="bg-primary text-white fw-bold text-center py-1 rounded mb-2" style="font-size:0.82rem;">
+                                    QUANTIDADE DEFESA
+                                </div>
+                                <table class="table table-dark table-sm table-bordered border-secondary align-middle mb-0 text-center">
+                                    <thead>
+                                        <tr class="text-secondary" style="font-size:0.72rem;">
+                                            <th>CLASSE</th>
+                                            <th>QUANTIDADE</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {% for cls in pw_classes %}
+                                        <tr>
+                                            <td><span class="badge cls-badge cls-{{ cls }}">{{ cls }}</span></td>
+                                            <td class="fw-bold fs-6" id="qtyDefense_{{ cls }}">{{ tw_defense_class_counts.get(cls, 0) }}</td>
+                                        </tr>
+                                        {% endfor %}
+                                    </tbody>
+                                    <tfoot>
+                                        <tr class="table-info text-dark fw-black">
+                                            <td>TOTAL</td>
+                                            <td class="fs-5" id="qtyDefenseTotal">{{ total_defense_players }}</td>
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {% if session['role'] == 'admin' %}
+            <div class="text-end">
+                <button type="submit" class="btn btn-success fw-bold px-5 py-2 shadow">
+                    <i class="fa-solid fa-floppy-disk me-1"></i> Salvar Todas as Alterações da Planilha (Ataque & Defesa)
+                </button>
+            </div>
+            {% endif %}
+        </form>
         {% else %}
-        <div class="col-12">
-            <div class="card p-5 text-center">
-                <i class="fa-solid fa-chess-rook fa-3x text-secondary mb-3"></i>
-                <h5>Nenhuma PT Criada na Planilha de TW Ainda</h5>
-                <p class="text-secondary small mb-0">
-                    Use o card amarelo acima para criar as PTs (ex: <strong>PT 01 - Catapulta</strong>) e escalar o Líder, os players online e quem vai jogar em cada char!
-                </p>
+        <div class="card p-5 text-center">
+            <i class="fa-solid fa-table-columns fa-3x text-warning mb-3"></i>
+            <h4>Sua Planilha de Controle de TW está pronta para começar!</h4>
+            <p class="text-secondary small mb-3">
+                Clique no botão abaixo para gerar automaticamente as 12 PTs do seu modelo Excel (<strong>CT, RECUPERAÇÃO, APOIO 1 a 4</strong> no Ataque + <strong>KILL CT 1 e 2, BACKDEF 1 a 4</strong> na Defesa) ou crie uma PT personalizada acima.
+            </p>
+            {% if session['role'] == 'admin' %}
+            <form method="POST" action="{{ url_for('seed_default_tw_pts') }}">
+                <button type="submit" class="btn btn-warning fw-bold text-dark px-4 py-2">
+                    <i class="fa-solid fa-wand-magic-sparkles me-1"></i> Gerar 12 PTs Padrão do Modelo Excel Agora
+                </button>
+            </form>
+            {% endif %}
+        </div>
+        {% endif %}
+
+    <!-- ==========================================================
+         MODO 2: VISUALIZAR E EDITAR PT INDIVIDUAL (COM SELETOR RÁPIDO DE PT)
+         ========================================================== -->
+    {% else %}
+        <!-- Barra de Seleção Rápida de PT para Visualizar / Editar -->
+        <div class="card p-3 mb-4 border-info">
+            <div class="row g-2 align-items-center">
+                <div class="col-md-5">
+                    <label class="small text-info fw-bold mb-1">
+                        <i class="fa-solid fa-magnifying-glass me-1"></i> Selecionar PT para Visualizar / Editar com Foco:
+                    </label>
+                    <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                            onchange="window.location.href=this.value">
+                        <option value="{{ url_for('dashboard', tab='tw', tw_view='cards') }}" {% if not selected_pt_id %}selected{% endif %}>
+                            -- Mostrar Todas as PTs ({{ tw_parties|length }}) --
+                        </option>
+                        <optgroup label="⚔️ PTs de ATAQUE">
+                            {% for pt in attack_parties %}
+                            <option value="{{ url_for('dashboard', tab='tw', tw_view='cards', pt_id=pt.id) }}" {% if selected_pt_id == pt.id %}selected{% endif %}>
+                                [ATAQUE] {{ pt.pt_name }} - {{ pt.pt_function or 'Geral' }} ({{ pt.filled_count }}/10)
+                            </option>
+                            {% endfor %}
+                        </optgroup>
+                        <optgroup label="🛡️ PTs de DEFESA">
+                            {% for pt in defense_parties %}
+                            <option value="{{ url_for('dashboard', tab='tw', tw_view='cards', pt_id=pt.id) }}" {% if selected_pt_id == pt.id %}selected{% endif %}>
+                                [DEFESA] {{ pt.pt_name }} - {{ pt.pt_function or 'Geral' }} ({{ pt.filled_count }}/10)
+                            </option>
+                            {% endfor %}
+                        </optgroup>
+                    </select>
+                </div>
+                <div class="col-md-7 text-md-end mt-2 mt-md-4">
+                    {% if selected_pt_id %}
+                    <a href="{{ url_for('dashboard', tab='tw', tw_view='cards') }}" class="btn btn-sm btn-outline-info">
+                        Ver Todas as PTs
+                    </a>
+                    {% endif %}
+                    <a href="{{ url_for('dashboard', tab='tw', tw_view='planilha') }}" class="btn btn-sm btn-warning text-dark fw-bold">
+                        <i class="fa-solid fa-table me-1"></i> Voltar para Visão Planilha Lado a Lado
+                    </a>
+                </div>
             </div>
         </div>
-        {% endfor %}
-    </div>
+
+        <div class="row g-4">
+            {% for pt in tw_parties if (not selected_pt_id or pt.id == selected_pt_id) %}
+            <div class="{% if selected_pt_id %}col-lg-8 mx-auto{% else %}col-lg-6{% endif %}">
+                <div class="card p-3 h-100 {% if pt.pt_side == 'DEFESA' %}border-primary{% else %}border-danger{% endif %}">
+                    {% if session['role'] == 'admin' %}
+                    <form method="POST" action="{{ url_for('save_tw_pt', pt_id=pt.id) }}">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center border-bottom border-secondary pb-2 mb-2 gap-2">
+                            <div class="d-flex gap-2 flex-grow-1">
+                                <select name="pt_side" class="form-select form-select-sm bg-dark {% if pt.pt_side == 'DEFESA' %}text-info border-primary{% else %}text-danger border-danger{% endif %} fw-bold" style="max-width: 120px;">
+                                    <option value="ATAQUE" {% if pt.pt_side == 'ATAQUE' %}selected{% endif %}>⚔️ ATAQUE</option>
+                                    <option value="DEFESA" {% if pt.pt_side == 'DEFESA' %}selected{% endif %}>🛡️ DEFESA</option>
+                                </select>
+                                <input type="text" name="pt_name" value="{{ pt.pt_name }}" class="form-control form-control-sm bg-dark text-warning fw-bold border-secondary" style="max-width: 140px;" required>
+                                <input type="text" name="pt_function" value="{{ pt.pt_function }}" class="form-control form-control-sm bg-dark text-info fw-semibold border-secondary" placeholder="Função da PT">
+                            </div>
+                            <span class="badge {% if pt.pt_side == 'DEFESA' %}bg-primary{% else %}bg-danger{% endif %}">{{ pt.filled_count }}/10</span>
+                        </div>
+
+                        <div class="row g-1 px-1 mb-1 text-secondary" style="font-size: 0.7rem; text-transform: uppercase;">
+                            <div class="col-2">Vaga</div>
+                            <div class="col-4">Nick (Guild / On / Novo)</div>
+                            <div class="col-4">Quem vai Jogar (Opcional)</div>
+                            <div class="col-2">Classe</div>
+                        </div>
+
+                        <div class="d-flex flex-column gap-2 mb-3">
+                            {% for s in pt.slots %}
+                            {% set is_ldr = (s.slot_number == 1) %}
+                            <div class="row g-1 align-items-center {% if is_ldr %}leader-slot-row{% else %}member-slot-row{% endif %}">
+                                <div class="col-2">
+                                    {% if is_ldr %}
+                                        <span class="badge bg-warning text-dark fw-bold w-100 py-1" style="font-size:0.7rem;">👑 LÍDER</span>
+                                    {% else %}
+                                        <span class="badge bg-dark border border-secondary text-secondary w-100 py-1" style="font-size:0.7rem;">
+                                            #{{ s.slot_number }}
+                                            {% if s.is_online_ts %}<span class="text-success ms-1">●</span>{% endif %}
+                                        </span>
+                                    {% endif %}
+                                </div>
+                                <div class="col-4">
+                                    <input type="text"
+                                           name="nick_{{ s.slot_number }}"
+                                           value="{{ s.player_nick }}"
+                                           list="allTwPlayersDatalist"
+                                           oninput="autoFillTwSlot(this, 'pilotInput_{{ pt.id }}_{{ s.slot_number }}', 'classSelect_{{ pt.id }}_{{ s.slot_number }}')"
+                                           class="form-control form-control-sm bg-dark {% if is_ldr %}text-warning fw-bold border-warning{% else %}text-light border-secondary{% endif %}"
+                                           placeholder="{% if is_ldr %}Nick Líder...{% else %}Nick...{% endif %}">
+                                </div>
+                                <div class="col-4">
+                                    <input type="text"
+                                           name="pilot_{{ s.slot_number }}"
+                                           id="pilotInput_{{ pt.id }}_{{ s.slot_number }}"
+                                           value="{{ s.pilot_nick or '' }}"
+                                           list="allTwPlayersDatalist"
+                                           class="form-control form-control-sm bg-black text-info border-secondary"
+                                           placeholder="Opcional: Piloto/Líder...">
+                                </div>
+                                <div class="col-2">
+                                    <select name="class_{{ s.slot_number }}"
+                                            id="classSelect_{{ pt.id }}_{{ s.slot_number }}"
+                                            class="form-select form-select-sm bg-dark text-warning fw-bold border-secondary px-1">
+                                        <option value="">--</option>
+                                        {% for cls in pw_classes %}
+                                        <option value="{{ cls }}" {% if s.player_class == cls %}selected{% endif %}>{{ cls }}</option>
+                                        {% endfor %}
+                                    </select>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+
+                        <div class="d-flex flex-wrap justify-content-between align-items-center pt-2 border-top border-secondary gap-2">
+                            <div class="form-check small text-secondary mb-0">
+                                <input class="form-check-input" type="checkbox" name="auto_register_new" value="1" id="autoReg{{ pt.id }}" checked>
+                                <label class="form-check-label" for="autoReg{{ pt.id }}" style="font-size: 0.75rem;">
+                                    Incluir na base se for nick novo
+                                </label>
+                            </div>
+                            <div class="d-flex gap-2">
+                                <button type="submit" class="btn btn-sm btn-success fw-bold px-3">
+                                    <i class="fa-solid fa-floppy-disk me-1"></i> Salvar {{ pt.pt_name }}
+                                </button>
+                                <button type="submit" form="deletePtForm{{ pt.id }}" class="btn btn-sm btn-outline-danger py-0 px-2">
+                                    <i class="fa-solid fa-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                    <form id="deletePtForm{{ pt.id }}" method="POST" action="{{ url_for('delete_tw_pt', pt_id=pt.id) }}" onsubmit="return confirm('Excluir a {{ pt.pt_name }}?');"></form>
+                    {% else %}
+                    <div class="d-flex justify-content-between align-items-center border-bottom border-secondary pb-2 mb-3">
+                        <div>
+                            <span class="badge {% if pt.pt_side == 'DEFESA' %}bg-primary{% else %}bg-danger{% endif %} me-1">{{ pt.pt_side }}</span>
+                            <span class="fs-5 fw-bold text-warning">{{ pt.pt_name }}</span>
+                            {% if pt.pt_function %}
+                                <span class="badge bg-info text-dark ms-2">{{ pt.pt_function }}</span>
+                            {% endif %}
+                        </div>
+                        <span class="badge bg-secondary">{{ pt.filled_count }}/10</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-dark table-sm align-middle mb-0">
+                            <thead>
+                                <tr class="text-secondary small">
+                                    <th>Vaga</th>
+                                    <th>Nick / Char</th>
+                                    <th>Quem vai Jogar</th>
+                                    <th class="text-end">Classe</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for s in pt.slots %}
+                                <tr>
+                                    <td>{% if s.slot_number == 1 %}<span class="badge bg-warning text-dark fw-bold">👑 1. LÍDER</span>{% else %}<span class="small text-secondary">#{{ s.slot_number }}</span>{% endif %}</td>
+                                    <td class="{% if s.slot_number == 1 %}fw-bold text-warning{% endif %}">{{ s.player_nick or '—' }}</td>
+                                    <td class="small text-info">{{ s.pilot_nick or '—' }}</td>
+                                    <td class="text-end">{% if s.player_class %}<span class="badge cls-badge cls-{{ s.player_class }}">{{ s.player_class }}</span>{% else %}—{% endif %}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    {% endif %}
     {% endif %}
 
     <!-- ==========================================================
@@ -3641,7 +4265,9 @@ MAIN_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-    // Mapa de nicks (Guild + Extras) -> Classe e Nota de Piloto para autopreencher na Planilha de TW
+    const PW_CLASSES_LIST = ["WR", "MG", "WF", "WB", "EA", "EP", "MC", "PSY", "MS", "SK"];
+
+    // Mapa equivalente ao PROCV (VLOOKUP) da aba BASE DE CONTAS do Excel
     const PLAYER_INFO_MAP = {
         {% for u in users %}
         "{{ u.ts_nick | lower | replace('\"', '') }}": {"cls": "{{ u.player_class }}", "pilot": ""},
@@ -3663,7 +4289,109 @@ MAIN_HTML = """
             if (pilotEl && !pilotEl.value && PLAYER_INFO_MAP[val].pilot) {
                 pilotEl.value = PLAYER_INFO_MAP[val].pilot;
             }
+        } else if (!val && selectEl) {
+            selectEl.value = "";
         }
+    }
+
+    // PROCV Automático + Recálculo de SUBTOTAL e CONT.SE (COUNTIF) na Visão Planilha Geral
+    function onMatrixNickInput(nickInputEl, classSelectId, pilotInputId) {
+        const val = (nickInputEl.value || "").trim().toLowerCase();
+        const selectEl = document.getElementById(classSelectId);
+        const pilotEl = document.getElementById(pilotInputId);
+
+        if (val && PLAYER_INFO_MAP[val]) {
+            if (selectEl && PLAYER_INFO_MAP[val].cls) {
+                selectEl.value = PLAYER_INFO_MAP[val].cls;
+            }
+            if (pilotEl && !pilotEl.value && PLAYER_INFO_MAP[val].pilot) {
+                pilotEl.value = PLAYER_INFO_MAP[val].pilot;
+            }
+        } else if (!val && selectEl) {
+            selectEl.value = "";
+        }
+        recalcTwMatrix();
+    }
+
+    function recalcTwMatrix() {
+        const attackCounts = {};
+        const defenseCounts = {};
+        const totalByClass = {};
+        PW_CLASSES_LIST.forEach(c => {
+            attackCounts[c] = 0;
+            defenseCounts[c] = 0;
+            totalByClass[c] = 0;
+        });
+
+        const ptCols = document.querySelectorAll('.tw-matrix-col');
+        ptCols.forEach(col => {
+            const ptId = col.getAttribute('data-pt-id');
+            const side = col.getAttribute('data-pt-side');
+            const nickInputs = col.querySelectorAll('.matrix-nick-input');
+            let ptFilled = 0;
+
+            nickInputs.forEach(inp => {
+                const nickVal = (inp.value || "").trim();
+                const selectId = inp.id.replace('mNick_', 'mClass_');
+                const clsEl = document.getElementById(selectId);
+                const clsVal = clsEl ? (clsEl.value || "").trim().toUpperCase() : "";
+
+                if (nickVal) {
+                    ptFilled += 1;
+                    if (PW_CLASSES_LIST.includes(clsVal)) {
+                        totalByClass[clsVal] += 1;
+                        if (side === 'DEFESA') {
+                            defenseCounts[clsVal] += 1;
+                        } else {
+                            attackCounts[clsVal] += 1;
+                        }
+                    }
+                }
+            });
+
+            const ptCountBadge = document.getElementById('ptCount_' + ptId);
+            if (ptCountBadge) {
+                ptCountBadge.textContent = ptFilled;
+            }
+        });
+
+        let sumAttack = 0;
+        let sumDefense = 0;
+        PW_CLASSES_LIST.forEach(c => {
+            sumAttack += attackCounts[c];
+            sumDefense += defenseCounts[c];
+
+            const atkCell = document.getElementById('qtyAttack_' + c);
+            if (atkCell) atkCell.textContent = attackCounts[c];
+
+            const defCell = document.getElementById('qtyDefense_' + c);
+            if (defCell) defCell.textContent = defenseCounts[c];
+
+            document.querySelectorAll('.live-total-cls-' + c).forEach(el => {
+                el.textContent = totalByClass[c];
+            });
+        });
+
+        const atkTotEl = document.getElementById('qtyAttackTotal');
+        if (atkTotEl) atkTotEl.textContent = sumAttack;
+
+        const defTotEl = document.getElementById('qtyDefenseTotal');
+        if (defTotEl) defTotEl.textContent = sumDefense;
+
+        const bannerAtk = document.getElementById('bannerAttackTotal');
+        if (bannerAtk) bannerAtk.textContent = sumAttack;
+
+        const bannerDef = document.getElementById('bannerDefenseTotal');
+        if (bannerDef) bannerDef.textContent = sumDefense;
+
+        const topAtk = document.getElementById('topAttackTotal');
+        if (topAtk) topAtk.textContent = sumAttack;
+
+        const topDef = document.getElementById('topDefenseTotal');
+        if (topDef) topDef.textContent = sumDefense;
+
+        const grandTot = document.getElementById('grandTotalTwBadge');
+        if (grandTot) grandTot.textContent = (sumAttack + sumDefense);
     }
 
     function syncDropdownTkp(selectEl) {
